@@ -1,0 +1,24 @@
+# Ambiente e caches Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Credenciais e tokens — nunca versionar
+credentials.json
+credentials_web.json
+token.json
+token.json.tmp
+token_cloud.json
+token_cloud.json.tmp
+token.pickle
+.streamlit/secrets.toml
+
+# Exportações com dados pessoais
+*.csv
+data/
+
+# Arquivos locais de IDE/SO
+.vscode/
+.DS_Store
