@@ -13,7 +13,11 @@ from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow, WSGITimeoutError
 
-from classroom_client import SCOPES, save_authorized_user_credentials
+from classroom_client import (
+    SCOPES,
+    recover_equivalent_scope_credentials,
+    save_authorized_user_credentials,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,26 +50,36 @@ def validate_web_credentials(path: Path = WEB_CREDENTIALS_PATH) -> None:
 
 
 def main() -> None:
-    validate_web_credentials()
+    validate_web_credentials(WEB_CREDENTIALS_PATH)
     os.chmod(WEB_CREDENTIALS_PATH, 0o600)
     flow = InstalledAppFlow.from_client_secrets_file(
         str(WEB_CREDENTIALS_PATH), SCOPES
     )
-    credentials = flow.run_local_server(
-        host="localhost",
-        port=8080,
-        open_browser=True,
-        timeout_seconds=300,
-        redirect_uri_trailing_slash=True,
-        authorization_prompt_message=(
-            "Abra esta URL para autorizar a conta docente usada no Cloud: {url}"
-        ),
-        success_message=(
-            "Token Cloud criado. Você pode fechar esta aba e voltar ao terminal."
-        ),
-        access_type="offline",
-        prompt="consent",
-    )
+    try:
+        credentials = flow.run_local_server(
+            host="localhost",
+            port=8080,
+            open_browser=True,
+            timeout_seconds=300,
+            redirect_uri_trailing_slash=True,
+            authorization_prompt_message=(
+                "Abra esta URL para autorizar a conta docente usada no Cloud: {url}"
+            ),
+            success_message=(
+                "Autorização Cloud recebida. Você pode fechar esta aba e voltar "
+                "ao terminal."
+            ),
+            access_type="offline",
+            prompt="consent",
+        )
+    except Warning as exc:
+        credentials = recover_equivalent_scope_credentials(flow, exc)
+
+    if credentials is None or not credentials.token or not credentials.valid:
+        raise RuntimeError("O Google não devolveu credenciais Cloud utilizáveis.")
+    if not credentials.refresh_token:
+        raise RuntimeError("O Google não devolveu um refresh token para o Cloud.")
+
     save_authorized_user_credentials(credentials, CLOUD_TOKEN_PATH)
     print(
         "token_cloud.json criado com permissão 600. Copie client_id, "

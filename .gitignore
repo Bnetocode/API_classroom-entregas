@@ -10,8 +10,10 @@ credentials.json
 credentials_web.json
 token.json
 token.json.tmp
+token.json.tmp.*
 token_cloud.json
 token_cloud.json.tmp
+token_cloud.json.tmp.*
 token.pickle
 .streamlit/secrets.toml
 

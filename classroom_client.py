@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,14 +28,30 @@ from googleapiclient.errors import HttpError
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 DEFAULT_TOKEN_PATH = BASE_DIR / "token.json"
+LOGGER = logging.getLogger(__name__)
+
+COURSEWORK_STUDENTS_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/classroom.coursework.students.readonly"
+)
+STUDENT_SUBMISSIONS_STUDENTS_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/classroom.student-submissions.students.readonly"
+)
 
 # Escopos mínimos de leitura já previstos no projeto. Não solicitamos e-mail,
 # anexos, escrita no Classroom nem dados de login/tempo de permanência.
 SCOPES = (
     "https://www.googleapis.com/auth/classroom.courses.readonly",
     "https://www.googleapis.com/auth/classroom.rosters.readonly",
-    "https://www.googleapis.com/auth/classroom.coursework.students.readonly",
+    COURSEWORK_STUDENTS_READONLY_SCOPE,
 )
+
+# O Google devolveu o identificador abaixo para a permissão somente leitura
+# solicitada pelo primeiro. O oauthlib transforma essa substituição observada
+# em uma exceção Warning; qualquer mudança diferente continua sendo rejeitada.
+_SCOPE_ALIASES = {
+    COURSEWORK_STUDENTS_READONLY_SCOPE: STUDENT_SUBMISSIONS_STUDENTS_READONLY_SCOPE,
+}
+_LOCAL_OAUTH_LOCK = threading.Lock()
 
 
 class ClassroomConfigurationError(RuntimeError):
@@ -45,6 +64,43 @@ class ClassroomAuthenticationRequired(RuntimeError):
 
 class ClassroomAPIError(RuntimeError):
     """Erro amigável produzido ao consultar a API do Classroom."""
+
+
+def _normalized_scopes(scopes: Any) -> frozenset[str]:
+    if not scopes:
+        return frozenset()
+    if isinstance(scopes, str):
+        scopes = scopes.split()
+    return frozenset(_SCOPE_ALIASES.get(str(scope), str(scope)) for scope in scopes)
+
+
+def recover_equivalent_scope_credentials(
+    flow: InstalledAppFlow, scope_warning: Warning
+) -> Credentials:
+    """Recupera o token emitido apenas para o mapeamento observado do Classroom."""
+
+    token = getattr(scope_warning, "token", None)
+    old_scopes = getattr(scope_warning, "old_scope", ())
+    new_scopes = getattr(scope_warning, "new_scope", ())
+    required = _normalized_scopes(SCOPES)
+    required_token_fields = ("access_token", "expires_at", "refresh_token")
+    if (
+        not isinstance(token, Mapping)
+        or any(not token.get(field) for field in required_token_fields)
+        or _normalized_scopes(old_scopes) != required
+        or _normalized_scopes(new_scopes) != required
+    ):
+        raise ClassroomAuthenticationRequired(
+            "O Google retornou permissões diferentes das solicitadas. "
+            "Revise os escopos OAuth e autorize novamente."
+        ) from scope_warning
+
+    # A troca do authorization code já ocorreu. O oauthlib anexa a resposta de
+    # token à exceção antes de interromper a atribuição à sessão.
+    flow.oauth2session.token = dict(token)
+    credentials = flow.credentials
+    LOGGER.info("OAuth retornou o mapeamento equivalente de escopo do Classroom.")
+    return credentials
 
 
 @dataclass(frozen=True)
@@ -62,10 +118,23 @@ def save_authorized_user_credentials(
     credentials: Credentials, token_path: Path = DEFAULT_TOKEN_PATH
 ) -> None:
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = token_path.with_suffix(f"{token_path.suffix}.tmp")
-    temporary_path.write_text(credentials.to_json(), encoding="utf-8")
-    os.chmod(temporary_path, 0o600)
-    temporary_path.replace(token_path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{token_path.name}.tmp.",
+        dir=token_path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1  # a partir daqui o context manager é dono do descritor.
+        with handle:
+            handle.write(credentials.to_json())
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(token_path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
 
 
 def load_local_credentials(
@@ -120,39 +189,68 @@ def authorize_local_account(
     também imprime no terminal a URL de autorização caso o navegador não abra.
     """
 
-    if not credentials_path.is_file():
-        raise ClassroomConfigurationError(
-            f"Arquivo OAuth não encontrado: {credentials_path.name}."
+    if not _LOCAL_OAUTH_LOCK.acquire(blocking=False):
+        raise ClassroomAuthenticationRequired(
+            "Já existe uma autorização Google em andamento. Conclua a aba aberta "
+            "e atualize o painel."
         )
 
     try:
-        client_config = json.loads(credentials_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ClassroomConfigurationError(
-            f"{credentials_path.name} não é um JSON OAuth válido."
-        ) from exc
+        if not credentials_path.is_file():
+            raise ClassroomConfigurationError(
+                f"Arquivo OAuth não encontrado: {credentials_path.name}."
+            )
 
-    if "installed" not in client_config:
-        raise ClassroomConfigurationError(
-            "Para o localhost, credentials.json deve ser do tipo Desktop app."
+        try:
+            client_config = json.loads(credentials_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ClassroomConfigurationError(
+                f"{credentials_path.name} não é um JSON OAuth válido."
+            ) from exc
+
+        if "installed" not in client_config:
+            raise ClassroomConfigurationError(
+                "Para o localhost, credentials.json deve ser do tipo Desktop app."
+            )
+
+        LOGGER.info("OAuth local iniciado. Token path: %s", token_path.resolve())
+        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
+        try:
+            credentials = flow.run_local_server(
+                port=0,
+                open_browser=True,
+                timeout_seconds=timeout_seconds,
+                authorization_prompt_message=(
+                    "Abra esta URL para escolher a conta Google que administra "
+                    "as turmas: {url}"
+                ),
+                success_message=(
+                    "Autorização concluída. Você pode fechar esta aba e voltar "
+                    "ao painel."
+                ),
+                access_type="offline",
+                prompt="consent",
+            )
+        except Warning as exc:
+            credentials = recover_equivalent_scope_credentials(flow, exc)
+
+        if credentials is None or not credentials.token or not credentials.valid:
+            raise ClassroomAuthenticationRequired(
+                "O Google não devolveu credenciais utilizáveis. Autorize novamente."
+            )
+        if not credentials.refresh_token:
+            raise ClassroomAuthenticationRequired(
+                "O Google não devolveu um refresh token. Autorize novamente."
+            )
+
+        LOGGER.info(
+            "Credenciais OAuth recebidas: True. Refresh token presente: True."
         )
-
-    flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
-    credentials = flow.run_local_server(
-        port=0,
-        open_browser=True,
-        timeout_seconds=timeout_seconds,
-        authorization_prompt_message=(
-            "Abra esta URL para escolher a conta Google que administra as turmas: {url}"
-        ),
-        success_message=(
-            "Autorização concluída. Você pode fechar esta aba e voltar ao painel."
-        ),
-        access_type="offline",
-        prompt="consent",
-    )
-    save_authorized_user_credentials(credentials, token_path)
-    return credentials
+        save_authorized_user_credentials(credentials, token_path)
+        LOGGER.info("Token salvo: %s", token_path.is_file())
+        return credentials
+    finally:
+        _LOCAL_OAUTH_LOCK.release()
 
 
 def credentials_from_cloud_secrets(secret: Mapping[str, Any]) -> Credentials:
