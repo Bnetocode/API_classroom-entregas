@@ -241,6 +241,39 @@ No modo Cloud não existe troca interativa de conta para visitantes. Para trocar
 a conta fixa do Cloud, execute novamente o provisionamento Web e substitua o
 Secrets do aplicativo.
 
+### Trocar a conta fixa do Classroom no Community Cloud
+
+Não é necessário alterar o código, o endereço do site ou fazer outro deploy.
+Usando o mesmo `credentials_web.json`, faça o seguinte:
+
+1. se o OAuth estiver em **External / Testing**, adicione a nova conta em
+   **Google Auth Platform > Audience > Test users**;
+2. execute localmente:
+
+```bash
+.venv/bin/python provision_cloud_token.py
+```
+
+3. na página oficial do Google, escolha **Usar outra conta**, selecione a nova
+   conta docente e conclua o consentimento;
+4. aguarde a criação do novo `token_cloud.json`;
+5. em **Streamlit Community Cloud > aplicativo > Settings > Secrets**, troque
+   somente o valor de `refresh_token` na seção `[google_oauth]`;
+6. mantenha os valores atuais de `client_id`, `client_secret`, `token_uri` e
+   `[app].password`;
+7. salve os Secrets e reinicie o aplicativo se isso não ocorrer
+   automaticamente.
+
+O `token_uri` continuará normalmente como
+`https://oauth2.googleapis.com/token`. Todos os visitantes autorizados passarão
+a ver as turmas da nova conta, pois `teacherId="me"` agora representa essa
+conta. Somente se outro cliente OAuth Web for criado será necessário substituir
+também `client_id` e `client_secret`.
+
+Se apenas novas turmas forem adicionadas à conta que já está conectada, não
+gere outro token. Aguarde até 10 minutos pelo cache da lista de turmas ou
+reinicie o aplicativo.
+
 ## Como os dados do Classroom são coletados
 
 `classroom_client.py` usa somente operações de leitura:
