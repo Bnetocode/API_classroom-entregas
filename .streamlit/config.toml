@@ -1,9 +1,32 @@
 [theme]
+font = "sans-serif"
+showSidebarBorder = true
+
+[theme.light]
 primaryColor = "#1F7A5A"
 backgroundColor = "#F7F9F7"
 secondaryBackgroundColor = "#EAF2ED"
 textColor = "#1F2D27"
-font = "sans-serif"
+
+[theme.light.sidebar]
+primaryColor = "#1F7A5A"
+backgroundColor = "#EAF2ED"
+secondaryBackgroundColor = "#DDE9E2"
+textColor = "#1F2D27"
+
+
+[theme.dark]
+primaryColor = "#46C99A"
+backgroundColor = "#101613"
+secondaryBackgroundColor = "#19221E"
+textColor = "#F2F6F4"
+
+[theme.dark.sidebar]
+primaryColor = "#46C99A"
+backgroundColor = "#141D19"
+secondaryBackgroundColor = "#1D2923"
+textColor = "#F2F6F4"
+
 
 [browser]
 gatherUsageStats = false
