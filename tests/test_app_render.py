@@ -26,7 +26,7 @@ def render_fixture(snapshot, data, risks) -> None:
         app._render_diagnostics_tab(snapshot, data, "local")
 
 
-def render_full_app(snapshot) -> None:
+def render_full_app(snapshot, auth_mode: str = "local") -> None:
     from unittest.mock import patch
 
     import app
@@ -40,7 +40,7 @@ def render_full_app(snapshot) -> None:
         }
     ]
     with (
-        patch.object(app, "_resolve_auth_mode", return_value=("local", "test")),
+        patch.object(app, "_resolve_auth_mode", return_value=(auth_mode, "test")),
         patch.object(app, "_cached_courses", return_value=courses),
         patch.object(app, "_cached_snapshot", return_value=snapshot),
     ):
@@ -65,6 +65,16 @@ class AppRenderTests(unittest.TestCase):
         app_test = AppTest.from_function(
             render_full_app,
             args=(sample_snapshot(),),
+            default_timeout=10,
+        ).run()
+
+        self.assertEqual(len(app_test.exception), 0)
+        self.assertEqual(app_test.title[0].value, "Acompanhamento do Google Classroom")
+
+    def test_cloud_app_renders_with_google_oauth_only(self) -> None:
+        app_test = AppTest.from_function(
+            render_full_app,
+            args=(sample_snapshot(), "cloud"),
             default_timeout=10,
         ).run()
 

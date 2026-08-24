@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hmac
 from typing import Any
 
 import pandas as pd
@@ -38,7 +37,6 @@ from classroom_client import (
 DAILY_CACHE_SECONDS = 24 * 60 * 60
 COURSE_CACHE_SECONDS = 10 * 60
 RISK_LEVELS = {"Crítico — início", "Alto", "Atenção"}
-MIN_DASHBOARD_PASSWORD_LENGTH = 12
 
 
 def _secret_section(name: str) -> dict[str, Any]:
@@ -78,39 +76,6 @@ def _cached_snapshot(
 def _clear_data_caches() -> None:
     _cached_courses.clear()
     _cached_snapshot.clear()
-
-
-def _dashboard_password() -> str:
-    app_secrets = _secret_section("app")
-    expected = str(app_secrets.get("password", "")).strip()
-    if expected == "DEFINA_UMA_SENHA_FORTE":
-        return ""
-    return expected
-
-
-def _require_dashboard_password() -> bool:
-    expected = _dashboard_password()
-    if not expected:
-        return True
-    if len(expected) < MIN_DASHBOARD_PASSWORD_LENGTH:
-        st.error(
-            f"A senha em `[app].password` precisa ter pelo menos "
-            f"{MIN_DASHBOARD_PASSWORD_LENGTH} caracteres."
-        )
-        return False
-    if st.session_state.get("dashboard_authorized") is True:
-        return True
-
-    st.title("Painel restrito")
-    st.caption("Informe a senha definida em `[app].password` no Streamlit Secrets.")
-    supplied = st.text_input("Senha de acesso", type="password")
-    if st.button("Entrar", type="primary"):
-        if hmac.compare_digest(supplied, expected):
-            st.session_state["dashboard_authorized"] = True
-            st.rerun()
-        else:
-            st.error("Senha incorreta.")
-    return False
 
 
 def _render_local_authorization(error_message: str | None = None) -> None:
@@ -598,23 +563,10 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    if not _require_dashboard_password():
-        return
-
     resolved = _resolve_auth_mode()
     if resolved is None:
         return
     auth_mode, auth_cache_key = resolved
-
-    cloud_password = _dashboard_password()
-    if auth_mode == "cloud" and (
-        not cloud_password or cloud_password == "DEFINA_UMA_SENHA_FORTE"
-    ):
-        st.error(
-            "Por segurança, o modo Cloud exige `[app].password` no Streamlit "
-            "Secrets antes de consultar dados pessoais."
-        )
-        return
 
     try:
         courses = _cached_courses(auth_cache_key, auth_mode)
@@ -686,9 +638,6 @@ def main() -> None:
             DEFAULT_TOKEN_PATH.unlink(missing_ok=True)
             st.session_state.pop("oauth_auto_started", None)
             _clear_data_caches()
-            st.rerun()
-        if _dashboard_password() and st.button("Sair do painel", width="stretch"):
-            st.session_state.pop("dashboard_authorized", None)
             st.rerun()
         st.divider()
         st.caption(

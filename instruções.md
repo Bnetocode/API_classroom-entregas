@@ -93,7 +93,7 @@ Nenhum e-mail fica fixado no projeto.
 | --- | --- |
 | `README.md` | Apresentação do propósito, das funcionalidades e do uso do site. |
 | `instruções.md` | Manual técnico de instalação, testes, publicação, recuperação e continuidade. |
-| `app.py` | Interface Streamlit, seleção de turma, filtros, mensagens de autenticação, senha adicional do painel, cache e troca de conta. |
+| `app.py` | Interface Streamlit, seleção de turma, filtros, mensagens de autenticação, cache e troca de conta. |
 | `classroom_client.py` | OAuth, caminhos absolutos, persistência e renovação do token, chamadas paginadas e coleta mínima da Classroom API. |
 | `analytics.py` | Normalização de prazos para `America/Recife`, inferência de etapas, taxas e classificação dos sinais de risco. |
 | `anexo_api_classroom_etapas_1a5.py` | Execução opcional pelo terminal para validar a API e gerar um CSV pontual. |
@@ -116,7 +116,7 @@ Nenhum e-mail fica fixado no projeto.
 | `token.json` | Autorização local criada depois do consentimento. Não precisa de backup: pode ser recriada autorizando a conta novamente. |
 | `credentials_web.json` | Cliente OAuth **Web application** usado somente pelo provisionador Cloud. |
 | `token_cloud.json` | Resultado sensível e temporário do provisionamento Cloud. Seus valores necessários vão para o Streamlit Secrets. |
-| `.streamlit/secrets.toml` | Secrets reais usados ao testar o modo Cloud ou a senha adicional do painel localmente. |
+| `.streamlit/secrets.toml` | Secrets reais usados ao testar o modo Cloud. |
 | `entregas_classroom.csv` | Exportação opcional que pode conter nomes e situação acadêmica. |
 | `__pycache__/` e `*.pyc` | Caches Python descartáveis. |
 
@@ -306,8 +306,7 @@ Usando o mesmo `credentials_web.json`, faça o seguinte:
 4. aguarde a criação do novo `token_cloud.json`;
 5. em **Streamlit Community Cloud > aplicativo > Settings > Secrets**, troque
    somente o valor de `refresh_token` na seção `[google_oauth]`;
-6. mantenha os valores atuais de `client_id`, `client_secret`, `token_uri` e
-   `[app].password`;
+6. mantenha os valores atuais de `client_id`, `client_secret` e `token_uri`;
 7. salve os Secrets e reinicie o aplicativo se isso não ocorrer
    automaticamente.
 
@@ -400,7 +399,7 @@ git diff --check
 git status --short
 ```
 
-No estado documentado deste projeto, a suíte contém 31 testes. Os testes são
+No estado documentado deste projeto, a suíte contém 32 testes. Os testes são
 isolados e não acessam a conta Google real.
 
 Depois de uma alteração no OAuth ou nas chamadas da API, faça também o teste
@@ -507,14 +506,10 @@ client_id = "..."
 client_secret = "..."
 refresh_token = "..."
 token_uri = "https://oauth2.googleapis.com/token"
-
-[app]
-password = "uma-senha-longa-e-exclusiva"
 ```
 
 `client_id`, `client_secret` e `refresh_token` precisam pertencer ao mesmo
-cliente Web. A senha em `[app]` é uma proteção adicional do painel, não é a
-senha da conta Google, e precisa ter pelo menos 12 caracteres.
+cliente Web.
 
 O retorno `localhost:8080` é usado somente durante o provisionamento feito pelo
 responsável. Depois disso, o Cloud renova o token já emitido e não apresenta
@@ -588,7 +583,6 @@ testes e repita o fluxo real antes de publicar.
 O painel trata nomes e situação acadêmica, que são dados pessoais:
 
 - mantenha o app Cloud privado e controle seus convidados;
-- configure `[app].password` com pelo menos 12 caracteres como camada adicional;
 - não persista, exiba nem exporte e-mails, notas, anexos ou descrições;
 - compartilhe exportações somente com coordenação/tutoria autorizada;
 - defina prazo de retenção e exclusão com a coordenação;
