@@ -7,7 +7,6 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 from google_auth_oauthlib.flow import WSGITimeoutError
-from googleapiclient.errors import HttpError
 
 from analytics import (
     DashboardData,
@@ -24,7 +23,6 @@ from classroom_client import (
     ClassroomSnapshot,
     authorize_local_account,
     build_classroom_service,
-    classroom_api_error,
     cloud_auth_cache_key,
     collect_course_snapshot,
     credentials_from_cloud_secrets,
@@ -57,11 +55,8 @@ def _credentials_for_mode(auth_mode: str):
 @st.cache_data(ttl=COURSE_CACHE_SECONDS, show_spinner=False)
 def _cached_courses(auth_cache_key: str, auth_mode: str) -> list[dict[str, Any]]:
     del auth_cache_key  # participa da chave do cache; o valor não é segredo.
-    service = build_classroom_service(_credentials_for_mode(auth_mode))
-    try:
+    with build_classroom_service(_credentials_for_mode(auth_mode)) as service:
         return list_teacher_courses(service)
-    except HttpError as exc:
-        raise classroom_api_error(exc) from exc
 
 
 @st.cache_data(ttl=DAILY_CACHE_SECONDS, show_spinner=False)
@@ -69,8 +64,8 @@ def _cached_snapshot(
     course_id: str, auth_cache_key: str, auth_mode: str
 ) -> ClassroomSnapshot:
     del auth_cache_key  # invalida o cache quando a autorização for trocada.
-    service = build_classroom_service(_credentials_for_mode(auth_mode))
-    return collect_course_snapshot(service, course_id)
+    with build_classroom_service(_credentials_for_mode(auth_mode)) as service:
+        return collect_course_snapshot(service, course_id)
 
 
 def _clear_data_caches() -> None:
@@ -182,7 +177,10 @@ def _overview_metrics(
 
 
 def _render_overview(
-    snapshot: ClassroomSnapshot, data: DashboardData, risks: pd.DataFrame
+    snapshot: ClassroomSnapshot,
+    data: DashboardData,
+    risks: pd.DataFrame,
+    include_without_deadline: bool = False,
 ) -> None:
     _overview_metrics(snapshot, data, risks)
     st.caption(
@@ -226,8 +224,13 @@ def _render_overview(
     )
     if no_deadline or future:
         st.info(
-            f"{future} atividade(s) ainda dentro do prazo e {no_deadline} sem prazo não "
-            "reduzem a taxa principal nem geram alerta automático."
+            f"{future} atividade(s) ainda dentro do prazo e {no_deadline} sem prazo "
+            "não reduzem a taxa principal. "
+            + (
+                "Pendências sem prazo estão incluídas nos alertas pela configuração atual."
+                if include_without_deadline
+                else "Essas atividades não geram alerta automático na configuração atual."
+            )
         )
 
     outside_roster = int(
@@ -279,7 +282,18 @@ def _render_risk_tab(
         "ultimo_movimento",
     ]
     if filtered.empty:
-        st.success("Nenhum aluno corresponde aos filtros atuais.")
+        if risks.empty:
+            st.info("Esta turma ainda não tem alunos no roster atual.")
+        elif not selected_levels:
+            st.info("Selecione ao menos um nível em “Níveis exibidos” para listar os alunos.")
+        elif not search and not risks["nivel_risco"].isin(RISK_LEVELS).any():
+            st.success("Nenhum aluno em atenção pelos critérios atuais.")
+            st.info(
+                "Para consultar os demais alunos, inclua “Em dia” ou “Sem atividades” "
+                "em “Níveis exibidos”, ou selecione um aluno no histórico abaixo."
+            )
+        else:
+            st.info("Nenhum aluno corresponde aos filtros atuais. Ajuste os níveis ou a busca.")
     else:
         table = filtered[display_columns].copy()
         table["taxa_entrega_vencida"] = table["taxa_entrega_vencida"].map(
@@ -542,7 +556,7 @@ def _render_dashboard_fragment(
         ["Visão geral", "Alunos em atenção", "Módulos e atividades", "Diagnóstico"]
     )
     with overview:
-        _render_overview(snapshot, data, risks)
+        _render_overview(snapshot, data, risks, include_without_deadline)
     with risk:
         _render_risk_tab(
             data,
@@ -563,7 +577,12 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    resolved = _resolve_auth_mode()
+    try:
+        resolved = _resolve_auth_mode()
+    except (ClassroomAPIError, ClassroomConfigurationError) as exc:
+        st.error(str(exc))
+        st.info("Verifique a conexão e a configuração de autenticação e recarregue a página.")
+        return
     if resolved is None:
         return
     auth_mode, auth_cache_key = resolved
@@ -630,7 +649,7 @@ def main() -> None:
             step=5,
         )
         if st.button("Atualizar agora", type="primary", width="stretch"):
-            _cached_snapshot.clear()
+            _cached_snapshot.clear(course_id, auth_cache_key, auth_mode)
             st.rerun()
         if auth_mode == "local" and st.button(
             "Trocar conta Google", width="stretch"

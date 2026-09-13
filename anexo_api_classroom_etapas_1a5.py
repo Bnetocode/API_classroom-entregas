@@ -9,11 +9,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from google_auth_oauthlib.flow import WSGITimeoutError
+
 from analytics import build_dashboard_data
 from classroom_client import (
     DEFAULT_CREDENTIALS_PATH,
     ClassroomAPIError,
     ClassroomAuthenticationRequired,
+    ClassroomConfigurationError,
     authorize_local_account,
     build_classroom_service,
     collect_course_snapshot,
@@ -117,6 +120,12 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (ClassroomAPIError, ClassroomAuthenticationRequired, RuntimeError) as exc:
+    except (
+        ClassroomAPIError,
+        ClassroomAuthenticationRequired,
+        ClassroomConfigurationError,
+        RuntimeError,
+        WSGITimeoutError,
+    ) as exc:
         raise SystemExit(f"Erro: {exc}") from exc
 

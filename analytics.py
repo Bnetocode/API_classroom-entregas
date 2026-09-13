@@ -6,7 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -19,6 +19,9 @@ DELIVERED_STATES = {
     "TURNED_IN",
     "RETURNED",
 }
+_AULA_0_PATTERN = re.compile(r"\baula[\s_-]*0\b")
+_MODULE_PATTERN = re.compile(r"\bmodulo[\s_-]*([1-9][0-9]*)\b")
+_MODULE_STAGE_PATTERN = re.compile(r"modulo\s*(\d+)")
 
 ACTIVITY_COLUMNS = [
     "atividade_id",
@@ -64,21 +67,29 @@ class DashboardData:
     collected_at: pd.Timestamp
 
 
-def _normalize_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value)
+def _normalize_text(value: Any) -> str:
+    normalized = unicodedata.normalize(
+        "NFKD", "" if value is None else str(value)
+    )
     return "".join(char for char in normalized if not unicodedata.combining(char)).casefold()
 
 
-def infer_stage(title: str) -> str:
+def _text_or_default(value: Any, default: str) -> str:
+    text = "" if value is None else str(value).strip()
+    return text or default
+
+
+def infer_stage(title: str | None) -> str:
     """Infere Aula 0/Módulo pelo título sem solicitar um escopo extra de tópicos."""
 
-    normalized = _normalize_text(title)
-    if re.search(r"\baula\s*0\b", normalized):
+    clean_title = _text_or_default(title, "Atividade sem título")
+    normalized = _normalize_text(clean_title).replace("_", " ")
+    if _AULA_0_PATTERN.search(normalized):
         return "Aula 0"
-    match = re.search(r"\bmodulo\s*([1-9][0-9]*)\b", normalized)
+    match = _MODULE_PATTERN.search(normalized)
     if match:
         return f"Módulo {int(match.group(1))}"
-    return title or "Atividade sem título"
+    return clean_title
 
 
 def is_critical_stage(stage: str) -> bool:
@@ -87,42 +98,48 @@ def is_critical_stage(stage: str) -> bool:
 
 
 def _parse_timestamp(value: Any) -> pd.Timestamp:
-    if not value:
+    if value is None:
         return pd.NaT
-    parsed = pd.to_datetime(value, utc=True, errors="coerce")
-    if pd.isna(parsed):
+    try:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    except (TypeError, ValueError):
+        return pd.NaT
+    if not isinstance(parsed, pd.Timestamp) or pd.isna(parsed):
         return pd.NaT
     return parsed.tz_convert(DISPLAY_TIMEZONE)
 
 
-def _due_timestamp(coursework: dict[str, Any]) -> tuple[pd.Timestamp, bool]:
+def _due_timestamp(coursework: Mapping[str, Any]) -> tuple[pd.Timestamp, bool]:
     date_value = coursework.get("dueDate")
-    if not date_value:
+    if not isinstance(date_value, Mapping):
         return pd.NaT, False
 
     try:
         year = int(date_value["year"])
         month = int(date_value["month"])
         day = int(date_value["day"])
-    except (KeyError, TypeError, ValueError):
+        due_time = coursework.get("dueTime")
+        if due_time is None:
+            # Sem horário explícito, usamos o fim do dia UTC de forma conservadora.
+            # Um objeto presente, mesmo {}, representa 00:00:00 UTC: o JSON
+            # protobuf pode omitir os campos numéricos com valor zero.
+            value = time(23, 59, 59)
+            inferred = True
+        elif not isinstance(due_time, Mapping):
+            return pd.NaT, False
+        else:
+            value = time(
+                int(due_time.get("hours", 0)),
+                int(due_time.get("minutes", 0)),
+                int(due_time.get("seconds", 0)),
+                int(due_time.get("nanos", 0)) // 1_000,
+            )
+            inferred = False
+        due_utc = datetime.combine(
+            datetime(year, month, day).date(), value, tzinfo=timezone.utc
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
         return pd.NaT, False
-
-    due_time = coursework.get("dueTime")
-    inferred = not bool(due_time)
-    if due_time:
-        hour = int(due_time.get("hours", 0))
-        minute = int(due_time.get("minutes", 0))
-        second = int(due_time.get("seconds", 0))
-        microsecond = int(due_time.get("nanos", 0)) // 1_000
-        value = time(hour, minute, second, microsecond)
-    else:
-        # Se o Classroom não informar horário, tratamos o fim do dia UTC como
-        # aproximação conservadora e sinalizamos ``prazo_inferido`` no dado.
-        value = time(23, 59, 59)
-
-    due_utc = datetime.combine(
-        datetime(year, month, day).date(), value, tzinfo=timezone.utc
-    )
     return pd.Timestamp(due_utc).tz_convert(DISPLAY_TIMEZONE), inferred
 
 
@@ -142,8 +159,10 @@ def build_dashboard_data(
 
     activity_records: list[dict[str, Any]] = []
     for item in snapshot.coursework:
+        if not isinstance(item, Mapping):
+            continue
         due_at, inferred = _due_timestamp(item)
-        title = item.get("title") or "Atividade sem título"
+        title = _text_or_default(item.get("title"), "Atividade sem título")
         activity_records.append(
             {
                 "atividade_id": str(item.get("id", "")),
@@ -170,23 +189,29 @@ def build_dashboard_data(
     activity_map = {
         record["atividade_id"]: record for record in activity_records
     }
-    student_map = {
-        str(student.get("userId", "")): student.get("fullName")
-        or "Nome não informado"
-        for student in snapshot.students
-    }
+    student_map: dict[str, str] = {}
+    for student in snapshot.students:
+        if not isinstance(student, Mapping):
+            continue
+        user_id = _text_or_default(student.get("userId"), "")
+        if user_id:
+            student_map[user_id] = _text_or_default(
+                student.get("fullName"), "Nome não informado"
+            )
 
     submission_records: list[dict[str, Any]] = []
     for item in snapshot.submissions:
-        activity_id = str(item.get("courseWorkId", ""))
+        if not isinstance(item, Mapping):
+            continue
+        activity_id = _text_or_default(item.get("courseWorkId"), "")
         activity = activity_map.get(activity_id)
         if not activity:
             continue
 
-        user_id = str(item.get("userId", ""))
+        user_id = _text_or_default(item.get("userId"), "")
         active_in_roster = user_id in student_map
 
-        state = str(item.get("state", "STATE_UNSPECIFIED"))
+        state = _text_or_default(item.get("state"), "STATE_UNSPECIFIED")
         delivered = state in DELIVERED_STATES
         late = item.get("late") is True
         overdue = bool(activity["atividade_vencida"] and not delivered)
@@ -234,7 +259,7 @@ def build_dashboard_data(
     )
 
     activity_summary = _build_activity_summary(activities, submissions)
-    module_summary = _build_module_summary(activities, submissions)
+    module_summary = _build_module_summary(activity_summary)
     collected_at = _parse_timestamp(snapshot.collected_at)
     return DashboardData(
         activities=activities,
@@ -301,7 +326,9 @@ def _build_activity_summary(
         summary[count_columns] = summary[count_columns].fillna(0).astype(int)
 
     summary["taxa_entrega_geral"] = (
-        summary["entregues"].div(summary["atribuicoes"].replace(0, pd.NA)) * 100
+        summary["entregues"].div(
+            summary["atribuicoes"].where(summary["atribuicoes"].ne(0))
+        ) * 100
     )
     summary["taxa_entrega_vencida"] = summary["taxa_entrega_geral"].where(
         summary["atividade_vencida"]
@@ -313,7 +340,7 @@ def _stage_sort_key(stage: str) -> tuple[int, int, str]:
     normalized = _normalize_text(stage)
     if normalized == "aula 0":
         return (0, 0, normalized)
-    match = re.fullmatch(r"modulo\s*(\d+)", normalized)
+    match = _MODULE_STAGE_PATTERN.fullmatch(normalized)
     if match:
         return (1, int(match.group(1)), normalized)
     return (2, 0, normalized)
@@ -322,13 +349,13 @@ def _stage_sort_key(stage: str) -> tuple[int, int, str]:
 def is_recognized_stage(stage: str) -> bool:
     normalized = _normalize_text(stage)
     return normalized == "aula 0" or bool(
-        re.fullmatch(r"modulo\s*\d+", normalized)
+        _MODULE_STAGE_PATTERN.fullmatch(normalized)
     )
 
 
-def _build_module_summary(
-    activities: pd.DataFrame, submissions: pd.DataFrame
-) -> pd.DataFrame:
+def _build_module_summary(activity_summary: pd.DataFrame) -> pd.DataFrame:
+    """Reutiliza os totais por atividade sem percorrer entregas a cada módulo."""
+
     columns = [
         "etapa",
         "atividades",
@@ -342,47 +369,38 @@ def _build_module_summary(
         "taxa_entrega_vencida",
         "variacao_pp",
     ]
-    if activities.empty:
+    if activity_summary.empty:
         return _empty_frame(columns)
 
-    records: list[dict[str, Any]] = []
-    for stage, stage_activities in activities.groupby("etapa", sort=False):
-        ids = set(stage_activities["atividade_id"])
-        stage_submissions = submissions[submissions["atividade_id"].isin(ids)]
-        due_submissions = stage_submissions[stage_submissions["atividade_vencida"]]
-        assignments = len(stage_submissions)
-        due_assignments = len(due_submissions)
-        delivered = int(stage_submissions["entregue"].sum()) if assignments else 0
-        due_delivered = int(due_submissions["entregue"].sum()) if due_assignments else 0
-        records.append(
-            {
-                "etapa": stage,
-                "atividades": len(stage_activities),
-                "atividades_vencidas": int(stage_activities["atividade_vencida"].sum()),
-                "atribuicoes": assignments,
-                "entregues": delivered,
-                "atribuicoes_vencidas": due_assignments,
-                "entregues_vencidas": due_delivered,
-                "pendencias_vencidas": int(due_assignments - due_delivered),
-                "taxa_entrega_geral": (
-                    delivered / assignments * 100 if assignments else pd.NA
-                ),
-                "taxa_entrega_vencida": (
-                    due_delivered / due_assignments * 100
-                    if due_assignments
-                    else pd.NA
-                ),
-            }
-        )
-
-    records.sort(key=lambda record: _stage_sort_key(str(record["etapa"])))
-    result = pd.DataFrame.from_records(records)
-    result["variacao_pp"] = pd.NA
-    ordered_mask = result["etapa"].map(is_recognized_stage)
-    ordered_rates = pd.to_numeric(
-        result.loc[ordered_mask, "taxa_entrega_vencida"], errors="coerce"
+    due = activity_summary["atividade_vencida"]
+    totals = activity_summary.assign(
+        atribuicoes_vencidas=activity_summary["atribuicoes"].where(due, 0),
+        entregues_vencidas=activity_summary["entregues"].where(due, 0),
     )
-    result.loc[ordered_mask, "variacao_pp"] = ordered_rates.diff()
+    result = totals.groupby("etapa", as_index=False, sort=False).agg(
+        atividades=("atividade_id", "size"),
+        atividades_vencidas=("atividade_vencida", "sum"),
+        atribuicoes=("atribuicoes", "sum"),
+        entregues=("entregues", "sum"),
+        atribuicoes_vencidas=("atribuicoes_vencidas", "sum"),
+        entregues_vencidas=("entregues_vencidas", "sum"),
+        pendencias_vencidas=("pendencias_vencidas", "sum"),
+    )
+    stage_order = sorted(
+        result.index, key=lambda index: _stage_sort_key(result.at[index, "etapa"])
+    )
+    result = result.loc[stage_order].reset_index(drop=True)
+    result["taxa_entrega_geral"] = result["entregues"].div(
+        result["atribuicoes"].where(result["atribuicoes"].ne(0))
+    ) * 100
+    result["taxa_entrega_vencida"] = result["entregues_vencidas"].div(
+        result["atribuicoes_vencidas"].where(result["atribuicoes_vencidas"].ne(0))
+    ) * 100
+    result["variacao_pp"] = float("nan")
+    ordered_mask = result["etapa"].map(is_recognized_stage)
+    result.loc[ordered_mask, "variacao_pp"] = result.loc[
+        ordered_mask, "taxa_entrega_vencida"
+    ].diff()
     return result[columns]
 
 
@@ -411,19 +429,28 @@ def build_student_risk_summary(
     ]
     records: list[dict[str, Any]] = []
     submissions = data.submissions
+    empty_rows = submissions.iloc[0:0]
+    submissions_by_student = {
+        str(user_id): rows
+        for user_id, rows in submissions.groupby("aluno_id", sort=False)
+    }
 
     for student in students:
-        user_id = str(student.get("userId", ""))
-        name = student.get("fullName") or "Nome não informado"
-        rows = submissions[submissions["aluno_id"] == user_id]
+        if not isinstance(student, Mapping):
+            continue
+        user_id = _text_or_default(student.get("userId"), "")
+        name = _text_or_default(student.get("fullName"), "Nome não informado")
+        rows = submissions_by_student.get(user_id, empty_rows)
         due_rows = rows[rows["atividade_vencida"]]
         overdue_rows = rows[rows["em_atraso"]]
         without_deadline = rows[(rows["sem_prazo"]) & (~rows["entregue"])]
         alert_rows = overdue_rows
         if include_without_deadline:
-            alert_rows = pd.concat([alert_rows, without_deadline]).drop_duplicates(
-                subset=["entrega_id"]
-            )
+            # As condições são disjuntas. O id da entrega só é único dentro
+            # de uma atividade; deduplicá-lo aqui apagaria outras pendências.
+            alert_rows = rows[
+                rows["em_atraso"] | (rows["sem_prazo"] & ~rows["entregue"])
+            ]
 
         critical = bool(
             not alert_rows.empty
@@ -438,7 +465,11 @@ def build_student_risk_summary(
             reason = f"{pending_for_alert} pendências acumuladas"
         elif pending_for_alert:
             level = "Atenção"
-            reason = "1 pendência que requer contato"
+            reason = (
+                "1 pendência que requer contato"
+                if pending_for_alert == 1
+                else f"{pending_for_alert} pendências que requerem contato"
+            )
         elif rows.empty:
             level = "Sem atividades"
             reason = "Nenhuma atividade atribuída"

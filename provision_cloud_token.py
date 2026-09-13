@@ -37,12 +37,12 @@ def validate_web_credentials(path: Path = WEB_CREDENTIALS_PATH) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("credentials_web.json não é um JSON OAuth válido.") from exc
 
-    if "web" not in config:
+    if not isinstance(config, dict) or not isinstance(config.get("web"), dict):
         raise RuntimeError(
             "credentials_web.json deve ser do tipo Web application, não Desktop."
         )
     redirects = config["web"].get("redirect_uris", [])
-    if REDIRECT_URI not in redirects:
+    if not isinstance(redirects, list) or REDIRECT_URI not in redirects:
         raise RuntimeError(
             f"Adicione exatamente {REDIRECT_URI} em Authorized redirect URIs "
             "do cliente Web e baixe o JSON novamente."
@@ -93,5 +93,5 @@ if __name__ == "__main__":
         main()
     except WSGITimeoutError as exc:
         raise SystemExit("Tempo de autorização encerrado; execute novamente.") from exc
-    except RuntimeError as exc:
+    except (OSError, RuntimeError) as exc:
         raise SystemExit(f"Erro: {exc}") from exc

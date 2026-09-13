@@ -355,6 +355,14 @@ evita solicitar um quarto escopo apenas para consultar os nomes dos tópicos.
 Mantenha esse padrão nos títulos do Classroom. O painel avisa quando não
 consegue reconhecer uma etapa.
 
+Na aba **Alunos em atenção**, o filtro inicial mostra somente Crítico, Alto e
+Atenção. Se todos estiverem em dia, a lista vazia é esperada. Inclua **Em dia**
+ou **Sem atividades** em **Níveis exibidos** para consultar os demais alunos.
+
+Um `dueTime` vazio (`{}`) representa meia-noite UTC (21h do dia anterior em
+Recife). Somente a ausência de `dueTime` utiliza o fim do dia UTC como
+aproximação, sinalizada em `prazo_inferido`.
+
 Submissões de participantes que saíram do roster continuam apenas nas taxas
 agregadas, com nome genérico, para uma desmatrícula não melhorar artificialmente
 o indicador. A lista nominal de intervenção contém somente o roster atual.
@@ -363,8 +371,8 @@ o indicador. A lista nominal de intervenção contém somente o roster atual.
 
 - A lista de turmas fica em cache por 10 minutos.
 - O snapshot da turma fica em cache por 24 horas.
-- **Atualizar agora** limpa o cache de snapshots do processo; a próxima leitura
-  de cada turma consultada volta à API.
+- **Atualizar agora** invalida somente o snapshot da turma selecionada para a
+  autorização atual e consulta a API novamente, preservando os demais caches.
 - Com o painel aberto, um fragmento verifica o cache a cada hora e faz nova
   consulta quando as 24 horas expiram.
 - Trocar autorização altera a chave de cache e impede misturar dados de contas.
@@ -399,8 +407,10 @@ git diff --check
 git status --short
 ```
 
-No estado documentado deste projeto, a suíte contém 32 testes. Os testes são
-isolados e não acessam a conta Google real.
+A suíte de testes é isolada e não acessa a conta Google real. Ela cobre
+prazos, níveis de risco, paginação, autenticação, filtros, histórico individual,
+turmas vazias e recuperação do último snapshot após uma falha de conexão.
+A descoberta pela raiz também funciona: `.venv/bin/python -m unittest discover -v`.
 
 Depois de uma alteração no OAuth ou nas chamadas da API, faça também o teste
 manual completo:
@@ -575,8 +585,8 @@ concedidos e que a conta tem permissão docente sobre a turma.
 ### Problemas depois de atualizar dependências
 
 As versões são fixadas porque mudanças em OAuth podem alterar o comportamento
-entre callback e persistência. Atualize uma dependência por vez, rode os 31
-testes e repita o fluxo real antes de publicar.
+entre callback e persistência. Atualize uma dependência por vez, rode a suíte
+completa e repita o fluxo real antes de publicar.
 
 ## Privacidade e segurança
 

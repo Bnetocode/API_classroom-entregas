@@ -17,18 +17,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
+from httplib2 import HttpLib2Error
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 DEFAULT_TOKEN_PATH = BASE_DIR / "token.json"
 LOGGER = logging.getLogger(__name__)
+
+# A seleção parcial evita transferir descrições, notas, anexos e históricos
+# que não são usados pelo painel. nextPageToken é mantido em todas as listas.
+_COURSE_FIELDS = (
+    "id", "name", "section", "descriptionHeading", "courseState", "alternateLink"
+)
+_COURSEWORK_FIELDS = (
+    "id", "title", "state", "creationTime", "updateTime", "dueDate", "dueTime",
+    "scheduledTime", "workType", "topicId", "alternateLink",
+)
+_SUBMISSION_FIELDS = (
+    "id", "courseWorkId", "userId", "state", "late", "creationTime", "updateTime",
+)
+_CONNECTION_ERROR_MESSAGE = (
+    "Não foi possível conectar ao Google Classroom. "
+    "Verifique a conexão e tente atualizar novamente."
+)
 
 COURSEWORK_STUDENTS_READONLY_SCOPE = (
     "https://www.googleapis.com/auth/classroom.coursework.students.readonly"
@@ -70,8 +88,31 @@ def _normalized_scopes(scopes: Any) -> frozenset[str]:
     if not scopes:
         return frozenset()
     if isinstance(scopes, str):
-        scopes = scopes.split()
-    return frozenset(_SCOPE_ALIASES.get(str(scope), str(scope)) for scope in scopes)
+        values = scopes.split()
+    else:
+        try:
+            values = iter(scopes)
+        except TypeError:
+            return frozenset()
+
+    normalized: set[str] = set()
+    for scope in values:
+        value = str(scope).strip()
+        if value:
+            normalized.add(_SCOPE_ALIASES.get(value, value))
+    return frozenset(normalized)
+
+
+def _credentials_have_required_scopes(credentials: Credentials) -> bool:
+    if credentials.has_scopes(SCOPES):
+        return True
+
+    granted_scopes = getattr(credentials, "granted_scopes", None)
+    if not granted_scopes:
+        granted_scopes = getattr(credentials, "scopes", None)
+    return _normalized_scopes(SCOPES).issubset(
+        _normalized_scopes(granted_scopes)
+    )
 
 
 def recover_equivalent_scope_credentials(
@@ -149,23 +190,25 @@ def load_local_credentials(
         # Não passe SCOPES aqui: isso sobrescreveria os escopos registrados no
         # JSON e faria ``has_scopes`` aprovar até um token incompleto.
         credentials = Credentials.from_authorized_user_file(str(token_path))
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
         raise ClassroomAuthenticationRequired(
             "O token local está ilegível. Autorize a conta novamente."
         ) from exc
 
-    if not credentials.has_scopes(SCOPES):
+    if not _credentials_have_required_scopes(credentials):
         raise ClassroomAuthenticationRequired(
             "Os escopos do token mudaram. Autorize a conta novamente."
         )
 
-    if credentials.expired and credentials.refresh_token:
+    if (credentials.expired or not credentials.valid) and credentials.refresh_token:
         try:
             credentials.refresh(Request())
         except RefreshError as exc:
             raise ClassroomAuthenticationRequired(
                 "A autorização expirou ou foi revogada. Autorize a conta novamente."
             ) from exc
+        except TransportError as exc:
+            raise ClassroomAPIError(_CONNECTION_ERROR_MESSAGE) from exc
         save_authorized_user_credentials(credentials, token_path)
 
     if not credentials.valid:
@@ -208,7 +251,9 @@ def authorize_local_account(
                 f"{credentials_path.name} não é um JSON OAuth válido."
             ) from exc
 
-        if "installed" not in client_config:
+        if not isinstance(client_config, Mapping) or not isinstance(
+            client_config.get("installed"), Mapping
+        ):
             raise ClassroomConfigurationError(
                 "Para o localhost, credentials.json deve ser do tipo Desktop app."
             )
@@ -260,8 +305,9 @@ def credentials_from_cloud_secrets(secret: Mapping[str, Any]) -> Credentials:
     missing = [
         key
         for key in required
-        if not str(secret.get(key, "")).strip()
-        or str(secret.get(key, "")).strip().startswith("SEU_")
+        if not isinstance(secret.get(key), str)
+        or not secret[key].strip()
+        or secret[key].strip().startswith("SEU_")
     ]
     if missing:
         raise ClassroomConfigurationError(
@@ -270,12 +316,12 @@ def credentials_from_cloud_secrets(secret: Mapping[str, Any]) -> Credentials:
 
     credentials = Credentials(
         token=None,
-        refresh_token=str(secret["refresh_token"]),
+        refresh_token=secret["refresh_token"].strip(),
         token_uri=str(
             secret.get("token_uri", "https://oauth2.googleapis.com/token")
         ),
-        client_id=str(secret["client_id"]),
-        client_secret=str(secret["client_secret"]),
+        client_id=secret["client_id"].strip(),
+        client_secret=secret["client_secret"].strip(),
         scopes=SCOPES,
     )
     try:
@@ -284,6 +330,8 @@ def credentials_from_cloud_secrets(secret: Mapping[str, Any]) -> Credentials:
         raise ClassroomAuthenticationRequired(
             "O refresh token configurado no Streamlit Secrets expirou ou é inválido."
         ) from exc
+    except TransportError as exc:
+        raise ClassroomAPIError(_CONNECTION_ERROR_MESSAGE) from exc
     return credentials
 
 
@@ -292,18 +340,17 @@ def local_auth_cache_key(token_path: Path = DEFAULT_TOKEN_PATH) -> str:
 
     try:
         info = json.loads(token_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return "local:sem-token"
-    stored_scopes = info.get("scopes") or []
-    if isinstance(stored_scopes, str):
-        stored_scopes = stored_scopes.split()
+    if not isinstance(info, Mapping):
+        return "local:sem-token"
     material = {
         "version": 1,
         "client_id": info.get("client_id", ""),
         "client_secret": info.get("client_secret", ""),
         "refresh_token": info.get("refresh_token", ""),
         "token_uri": info.get("token_uri", ""),
-        "scopes": sorted(stored_scopes),
+        "scopes": sorted(_normalized_scopes(info.get("scopes"))),
         "required_scopes": sorted(SCOPES),
     }
     digest = hashlib.sha256(
@@ -343,12 +390,42 @@ def _execute_paginated(
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     page_token: str | None = None
+    seen_page_tokens: set[str] = set()
+
     while True:
+        if page_token is not None:
+            if page_token in seen_page_tokens:
+                raise ClassroomAPIError(
+                    "A API do Classroom repetiu uma página da consulta. "
+                    "Tente atualizar novamente."
+                )
+            seen_page_tokens.add(page_token)
+
         response = request_factory(page_token).execute(num_retries=3)
-        records.extend(response.get(response_key, []))
-        page_token = response.get("nextPageToken")
-        if not page_token:
+        if not isinstance(response, Mapping):
+            raise ClassroomAPIError(
+                "O Google Classroom retornou uma resposta em formato inesperado."
+            )
+
+        page_records = response.get(response_key, [])
+        if page_records is None:
+            page_records = []
+        if not isinstance(page_records, list) or any(
+            not isinstance(record, Mapping) for record in page_records
+        ):
+            raise ClassroomAPIError(
+                "O Google Classroom retornou dados em formato inesperado."
+            )
+        records.extend(dict(record) for record in page_records)
+
+        next_page_token = response.get("nextPageToken")
+        if not next_page_token:
             return records
+        if not isinstance(next_page_token, str):
+            raise ClassroomAPIError(
+                "O Google Classroom retornou uma página em formato inesperado."
+            )
+        page_token = next_page_token
 
 
 def list_teacher_courses(service: Resource) -> list[dict[str, Any]]:
@@ -359,6 +436,7 @@ def list_teacher_courses(service: Resource) -> list[dict[str, Any]]:
             "teacherId": "me",
             "courseStates": ["ACTIVE"],
             "pageSize": 100,
+            "fields": f"nextPageToken,courses({','.join(_COURSE_FIELDS)})",
         }
         if page_token:
             params["pageToken"] = page_token
@@ -368,6 +446,12 @@ def list_teacher_courses(service: Resource) -> list[dict[str, Any]]:
         courses = _execute_paginated(request, "courses")
     except HttpError as exc:
         raise classroom_api_error(exc) from exc
+    except RefreshError as exc:
+        raise ClassroomAuthenticationRequired(
+            "A autorização expirou ou foi revogada. Autorize a conta novamente."
+        ) from exc
+    except (TransportError, HttpLib2Error, OSError) as exc:
+        raise ClassroomAPIError(_CONNECTION_ERROR_MESSAGE) from exc
     sanitized = [
         {
             "id": course.get("id", ""),
@@ -384,7 +468,13 @@ def list_teacher_courses(service: Resource) -> list[dict[str, Any]]:
 
 
 def _get_course(service: Resource, course_id: str) -> dict[str, Any]:
-    course = service.courses().get(id=course_id).execute(num_retries=3)
+    course = service.courses().get(
+        id=course_id, fields=",".join(_COURSE_FIELDS)
+    ).execute(num_retries=3)
+    if not isinstance(course, Mapping):
+        raise ClassroomAPIError(
+            "O Google Classroom retornou uma turma em formato inesperado."
+        )
     return {
         "id": course.get("id", course_id),
         "name": course.get("name", "Turma sem nome"),
@@ -397,7 +487,11 @@ def _get_course(service: Resource, course_id: str) -> dict[str, Any]:
 
 def _list_students(service: Resource, course_id: str) -> list[dict[str, Any]]:
     def request(page_token: str | None) -> Any:
-        params: dict[str, Any] = {"courseId": course_id, "pageSize": 100}
+        params: dict[str, Any] = {
+            "courseId": course_id,
+            "pageSize": 100,
+            "fields": "nextPageToken,students(userId,profile/name/fullName)",
+        }
         if page_token:
             params["pageToken"] = page_token
         return service.courses().students().list(**params)
@@ -425,28 +519,15 @@ def _list_coursework(service: Resource, course_id: str) -> list[dict[str, Any]]:
             "courseWorkStates": ["PUBLISHED"],
             "orderBy": "dueDate asc,updateTime asc",
             "pageSize": 100,
+            "fields": f"nextPageToken,courseWork({','.join(_COURSEWORK_FIELDS)})",
         }
         if page_token:
             params["pageToken"] = page_token
         return service.courses().courseWork().list(**params)
 
     coursework = _execute_paginated(request, "courseWork")
-    fields = (
-        "id",
-        "title",
-        "state",
-        "creationTime",
-        "updateTime",
-        "dueDate",
-        "dueTime",
-        "scheduledTime",
-        "workType",
-        "topicId",
-
-        "alternateLink",
-    )
     return [
-        {field: item[field] for field in fields if field in item}
+        {field: item[field] for field in _COURSEWORK_FIELDS if field in item}
         for item in coursework
         if item.get("id")
     ]
@@ -465,6 +546,9 @@ def _list_submissions(
             # atividades, evitando uma chamada separada para cada atividade.
             "courseWorkId": "-",
             "pageSize": 100,
+            "fields": (
+                f"nextPageToken,studentSubmissions({','.join(_SUBMISSION_FIELDS)})"
+            ),
         }
         if page_token:
             params["pageToken"] = page_token
@@ -476,17 +560,8 @@ def _list_submissions(
         )
 
     submissions = _execute_paginated(request, "studentSubmissions")
-    fields = (
-        "id",
-        "courseWorkId",
-        "userId",
-        "state",
-        "late",
-        "creationTime",
-        "updateTime",
-    )
     return [
-        {field: item[field] for field in fields if field in item}
+        {field: item[field] for field in _SUBMISSION_FIELDS if field in item}
         for item in submissions
         if item.get("courseWorkId") and item.get("userId")
     ]
@@ -504,6 +579,12 @@ def collect_course_snapshot(service: Resource, course_id: str) -> ClassroomSnaps
         )
     except HttpError as exc:
         raise classroom_api_error(exc) from exc
+    except RefreshError as exc:
+        raise ClassroomAuthenticationRequired(
+            "A autorização expirou ou foi revogada. Autorize a conta novamente."
+        ) from exc
+    except (TransportError, HttpLib2Error, OSError) as exc:
+        raise ClassroomAPIError(_CONNECTION_ERROR_MESSAGE) from exc
 
     published_ids = {item["id"] for item in coursework}
     submissions = [
