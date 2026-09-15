@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from analytics import build_dashboard_data, build_student_risk_summary, infer_stage
+from analytics import (
+    _build_module_summary,
+    build_dashboard_data,
+    build_student_risk_summary,
+    infer_stage,
+)
 from classroom_client import ClassroomSnapshot
 
 
@@ -91,7 +96,61 @@ def sample_snapshot() -> ClassroomSnapshot:
 
 
 class DashboardAnalyticsTests(unittest.TestCase):
-    def test_future_and_no_deadline_do_not_create_false_alerts(self) -> None:
+    def test_module_summary_derives_pending_without_input_column(self) -> None:
+        snapshot = sample_snapshot()
+        snapshot = replace(snapshot, coursework=[
+            dict(activity, title="Módulo 2") for activity in snapshot.coursework
+        ])
+        activities = build_dashboard_data(snapshot, now=NOW).activity_summary
+        modules = _build_module_summary(activities.drop(columns="pendentes"))
+        self.assertEqual(len(modules), 1)
+        self.assertEqual(modules.iloc[0]["atribuicoes"], 6)
+        self.assertEqual(modules.iloc[0]["entregues"], 3)
+        self.assertEqual(modules.iloc[0]["pendentes"], 3)
+        self.assertEqual(modules.iloc[0]["taxa_entrega_geral"], 50)
+        self.assertEqual(modules.iloc[0]["pendencias_vencidas"], 1)
+        empty = _build_module_summary(activities.iloc[:0].drop(columns="pendentes"))
+        self.assertTrue(empty.empty)
+        self.assertIn("pendentes", empty.columns)
+
+    def test_deadline_changes_do_not_change_rates_pending_counts_or_risk(self) -> None:
+        snapshot = sample_snapshot()
+        baseline = build_dashboard_data(snapshot, now=NOW)
+        baseline_risks = build_student_risk_summary(baseline, snapshot.students)
+        for deadline in (None, {"year": 2020, "month": 1, "day": 1},
+                         {"year": 2030, "month": 1, "day": 1}):
+            with self.subTest(deadline=deadline):
+                changed = replace(snapshot, coursework=[
+                    dict(activity, dueDate=deadline) for activity in snapshot.coursework
+                ])
+                data = build_dashboard_data(changed, now=NOW)
+                for table in ("activity_summary", "module_summary"):
+                    fields = ["atribuicoes", "entregues", "pendentes", "taxa_entrega_geral"]
+                    if table == "module_summary":
+                        fields.append("variacao_pp")
+                    pd.testing.assert_frame_equal(
+                        getattr(data, table)[fields], getattr(baseline, table)[fields]
+                    )
+                risks = build_student_risk_summary(data, changed.students)
+                fields = ["aluno_id", "nivel_risco", "motivo", "pendentes", "taxa_entrega_geral"]
+                pd.testing.assert_frame_equal(risks[fields], baseline_risks[fields])
+                if deadline is None:
+                    pending = data.submissions[data.submissions["entregue"].eq(False)]
+                    self.assertTrue(pending["situacao"].eq("Sem prazo — revisão manual").all())
+
+    def test_stage_without_assignments_breaks_rate_comparison(self) -> None:
+        snapshot = sample_snapshot()
+        snapshot = replace(snapshot, coursework=[
+            {"id": "aula0", "title": "Módulo 2"},
+            {"id": "empty", "title": "Módulo 3"},
+            {"id": "extra", "title": "Módulo 4"},
+        ])
+        modules = build_dashboard_data(snapshot, now=NOW).module_summary.set_index("etapa")
+        self.assertTrue(pd.isna(modules.loc["Módulo 3", "taxa_entrega_geral"]))
+        self.assertTrue(pd.isna(modules.loc["Módulo 4", "variacao_pp"]))
+        self.assertEqual(modules.loc["Módulo 3", "pendentes"], 0)
+
+    def test_non_deliveries_count_with_past_future_and_missing_deadlines(self) -> None:
         snapshot = sample_snapshot()
         data = build_dashboard_data(snapshot, now=NOW)
         risks = build_student_risk_summary(data, snapshot.students)
@@ -100,6 +159,8 @@ class DashboardAnalyticsTests(unittest.TestCase):
         self.assertEqual(bob["nivel_risco"], "Crítico — início")
         self.assertEqual(int(bob["pendencias_vencidas"]), 1)
         self.assertEqual(int(bob["pendencias_sem_prazo"]), 1)
+        self.assertEqual(int(bob["pendentes"]), 3)
+        self.assertEqual(int(data.module_summary["pendentes"].sum()), 3)
 
         due = data.submissions[data.submissions["atividade_vencida"]]
         self.assertEqual(len(due), 2)
@@ -186,17 +247,12 @@ class DashboardAnalyticsTests(unittest.TestCase):
         )
         data = build_dashboard_data(snapshot, now=NOW)
 
-        default_risks = build_student_risk_summary(
-            data, snapshot.students
-        ).set_index("aluno_id")
-        manual_risks = build_student_risk_summary(
-            data, snapshot.students, include_without_deadline=True
-        ).set_index("aluno_id")
-        self.assertEqual(default_risks.loc["bob", "nivel_risco"], "Atenção")
-        self.assertEqual(manual_risks.loc["bob", "nivel_risco"], "Alto")
-        self.assertEqual(manual_risks.loc["bob", "motivo"], "2 pendências acumuladas")
+        risks = build_student_risk_summary(data, snapshot.students).set_index("aluno_id")
+        self.assertEqual(risks.loc["bob", "nivel_risco"], "Alto")
+        self.assertEqual(risks.loc["bob", "pendentes"], 2)
+        self.assertEqual(risks.loc["bob", "motivo"], "2 pendências acumuladas")
 
-    def test_risk_levels_follow_deadlines_and_configured_threshold(self) -> None:
+    def test_risk_levels_follow_non_deliveries_and_configured_threshold(self) -> None:
         snapshot = sample_snapshot()
         snapshot = replace(
             snapshot,
@@ -248,7 +304,7 @@ class DashboardAnalyticsTests(unittest.TestCase):
         self.assertEqual(submissions.loc["bob", "situacao"], "Atrasada não entregue")
         self.assertEqual(int(data.activity_summary["entregas_atrasadas"].sum()), 1)
 
-    def test_module_rates_use_assignments_and_only_compare_due_stages(self) -> None:
+    def test_module_rates_weight_assignments_and_compare_stages_without_deadline_filter(self) -> None:
         snapshot = sample_snapshot()
         states = [
             ("m2-a", "alice", "TURNED_IN"),
@@ -280,10 +336,11 @@ class DashboardAnalyticsTests(unittest.TestCase):
             list(modules.index),
             ["Módulo 2", "Módulo 10", "Módulo 11", "Módulo 12", "Extra"],
         )
-        self.assertAlmostEqual(float(modules.loc["Módulo 2", "taxa_entrega_vencida"]), 100 / 3)
+        self.assertAlmostEqual(float(modules.loc["Módulo 2", "taxa_entrega_geral"]), 100 / 3)
         self.assertAlmostEqual(float(modules.loc["Módulo 10", "variacao_pp"]), -100 / 3)
-        self.assertTrue(pd.isna(modules.loc["Módulo 11", "taxa_entrega_vencida"]))
-        self.assertTrue(pd.isna(modules.loc["Módulo 12", "variacao_pp"]))
+        self.assertEqual(modules.loc["Módulo 11", "taxa_entrega_geral"], 0)
+        self.assertEqual(modules.loc["Módulo 11", "variacao_pp"], 0)
+        self.assertEqual(modules.loc["Módulo 12", "variacao_pp"], 0)
         self.assertTrue(pd.isna(modules.loc["Extra", "variacao_pp"]))
 
     def test_activities_without_submissions_keep_zero_counts_and_missing_rates(self) -> None:
@@ -292,9 +349,9 @@ class DashboardAnalyticsTests(unittest.TestCase):
         self.assertTrue(data.activity_summary["atribuicoes"].eq(0).all())
         self.assertTrue(data.activity_summary["taxa_entrega_geral"].isna().all())
         self.assertTrue(data.module_summary["atribuicoes"].eq(0).all())
-        self.assertTrue(data.module_summary["taxa_entrega_vencida"].isna().all())
+        self.assertTrue(data.module_summary["taxa_entrega_geral"].isna().all())
         risks = build_student_risk_summary(
-            data, snapshot.students, include_without_deadline=True
+            data, snapshot.students
         )
         self.assertTrue(risks["nivel_risco"].eq("Sem atividades").all())
 
@@ -338,7 +395,8 @@ class DashboardAnalyticsTests(unittest.TestCase):
         self.assertTrue(data.activities.empty)
         self.assertTrue(data.submissions.empty)
         self.assertIn("situacao", data.submissions.columns)
-        self.assertIn("taxa_entrega_vencida", data.activity_summary.columns)
+        self.assertIn("taxa_entrega_geral", data.activity_summary.columns)
+        self.assertIn("pendentes", data.module_summary.columns)
 
 
 if __name__ == "__main__":

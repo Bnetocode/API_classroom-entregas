@@ -341,13 +341,19 @@ dependeriam da Admin Reports API de uma organização Workspace.
 ## Como os indicadores são calculados
 
 - `TURNED_IN` e `RETURNED` contam como entrega.
-- A taxa principal considera somente atividades cujo prazo já venceu.
-- Atividade futura aparece como pendente dentro do prazo e não gera risco.
-- Atividade sem prazo fica em revisão manual e não gera risco por padrão; a
-  barra lateral permite incluí-la explicitamente.
+- A taxa de entrega é **100 × entregues / atribuições**, contando uma atividade
+  por aluno e incluindo todos os registros recebidos, com ou sem prazo.
+- O card **Não entregue**, as tabelas e os alertas contam toda atribuição não
+  entregue, inclusive com prazo futuro ou ausente. Não entrega não significa atraso.
+- O gráfico de situações mantém `Sem prazo — revisão manual` e os demais detalhes
+  de prazo, que não filtram a taxa nem os alertas. Não há opção para excluir sem prazo.
+- Sem atribuições retornadas, as contagens são zero e as taxas são `—`; o painel
+  não fabrica pendências a partir de alunos × atividades.
 - Qualquer pendência elegível na **Aula 0/Módulo 1** vira alerta crítico.
 - Nas demais etapas, o limite de pendências para risco alto é configurável.
-- A queda da taxa entre etapas é mostrada em pontos percentuais.
+- A queda da taxa geral entre etapas é mostrada em pontos percentuais; etapas
+  sem atribuições interrompem a comparação. As taxas por etapa usam a soma de
+  entregas e atribuições, sem fazer média simples de percentuais de atividades.
 - Datas e horários são normalizados para `America/Recife`.
 
 A etapa é inferida do título da atividade (`Aula 0`, `Módulo 1`, etc.). Isso
@@ -581,6 +587,18 @@ concedidos e que a conta tem permissão docente sobre a turma.
   porta ao Streamlit.
 - `8080`: usada somente por `provision_cloud_token.py`.
 - OAuth Desktop local: usa automaticamente uma porta dinâmica livre.
+
+### Coluna ausente ou indicadores antigos depois de alterar o código
+
+Após atualizar `app.py` e `analytics.py`, reinicie o processo Streamlit se a
+interface apresentar `KeyError` de coluna ou continuar usando regras antigas.
+Encerre com **Ctrl+C** no terminal e execute novamente o comando de inicialização.
+Recarregar a página ou clicar em **Atualizar agora** pode não recarregar um módulo
+Python antigo que permaneceu em memória. Isso não exige apagar o token Google.
+
+Nos resumos, `pendentes` significa **atribuições − entregues**, sem filtro de
+prazo. A interface recalcula essa coluna para módulos, atividades e alunos,
+inclusive quando recebe um resumo de versão anterior sem a coluna.
 
 ### Problemas depois de atualizar dependências
 

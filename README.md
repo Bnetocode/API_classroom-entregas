@@ -16,8 +16,8 @@ consistente. Em vez de conferir atividade por atividade no Classroom, a equipe
 pode visualizar em um só lugar:
 
 - quantos alunos e atividades existem na turma;
-- a taxa de entrega das atividades cujo prazo já venceu;
-- entregas realizadas, entregas com atraso e pendências vencidas;
+- a taxa de entrega de todas as atividades atribuídas aos alunos;
+- entregas realizadas e atividades não entregues, com ou sem prazo;
 - desempenho por Aula 0, Módulo 1 e etapas seguintes;
 - alunos que precisam de atenção da tutoria;
 - quedas coletivas de participação entre etapas.
@@ -48,8 +48,8 @@ Google Classroom → coleta somente leitura → cálculo dos indicadores → pai
 
 ### Visão geral
 
-Mostra os totais de alunos e atividades, a taxa de entrega das atividades
-vencidas, a quantidade de pendências vencidas e o número de alunos em atenção.
+Mostra os totais de alunos e atividades, a taxa de entrega geral, a quantidade
+de atividades não entregues por aluno e o número de alunos em atenção.
 Também apresenta gráficos da taxa de entrega por etapa e da situação das
 entregas.
 
@@ -78,17 +78,18 @@ atual; esse arquivo contém dados pessoais e deve ser tratado de forma restrita.
 ### Controles da barra lateral
 
 A barra lateral permite selecionar a turma, definir o número de pendências que
-gera risco alto, incluir ou não atividades sem prazo nos alertas, configurar a
-queda coletiva mínima e solicitar uma atualização. No modo local, também é
-possível trocar a conta Google conectada.
+gera risco alto, configurar a queda coletiva mínima e solicitar uma atualização.
+No modo local, também é possível trocar a conta Google conectada.
 
 ## Regras principais dos indicadores
 
 - Estados `TURNED_IN` e `RETURNED` são considerados entregues.
-- A taxa principal usa somente atividades cujo prazo já venceu.
-- Uma atividade futura não gera alerta de atraso.
-- Atividades sem prazo ficam em revisão manual e só entram nos alertas quando
-  essa opção é ativada.
+- A taxa de entrega é **100 × entregues / atribuições**, contando cada atividade
+  uma vez por aluno, independentemente de prazo. Sem atribuições, a taxa é `—`.
+- Toda atribuição não entregue entra no card **Não entregue** e nos alertas,
+  inclusive com prazo futuro ou sem prazo. Isso não significa atraso.
+- O gráfico de situações preserva **Sem prazo — revisão manual** e os demais
+  detalhes de prazo; essas categorias não excluem registros dos indicadores.
 - Uma pendência elegível na **Aula 0** ou no **Módulo 1** gera nível crítico.
 - Nas demais etapas, o limite de pendências para risco alto é configurável.
 - A etapa é identificada pelo texto `Aula 0` ou `Módulo N` no título da

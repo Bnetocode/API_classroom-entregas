@@ -362,6 +362,7 @@ def _build_module_summary(activity_summary: pd.DataFrame) -> pd.DataFrame:
         "atividades_vencidas",
         "atribuicoes",
         "entregues",
+        "pendentes",
         "atribuicoes_vencidas",
         "entregues_vencidas",
         "pendencias_vencidas",
@@ -386,6 +387,7 @@ def _build_module_summary(activity_summary: pd.DataFrame) -> pd.DataFrame:
         entregues_vencidas=("entregues_vencidas", "sum"),
         pendencias_vencidas=("pendencias_vencidas", "sum"),
     )
+    result["pendentes"] = result["atribuicoes"] - result["entregues"]
     stage_order = sorted(
         result.index, key=lambda index: _stage_sort_key(result.at[index, "etapa"])
     )
@@ -399,7 +401,7 @@ def _build_module_summary(activity_summary: pd.DataFrame) -> pd.DataFrame:
     result["variacao_pp"] = float("nan")
     ordered_mask = result["etapa"].map(is_recognized_stage)
     result.loc[ordered_mask, "variacao_pp"] = result.loc[
-        ordered_mask, "taxa_entrega_vencida"
+        ordered_mask, "taxa_entrega_geral"
     ].diff()
     return result[columns]
 
@@ -409,9 +411,8 @@ def build_student_risk_summary(
     students: list[dict[str, Any]],
     *,
     high_risk_threshold: int = 2,
-    include_without_deadline: bool = False,
 ) -> pd.DataFrame:
-    """Calcula os alertas de forma transparente e configurável."""
+    """Conta toda não entrega nos alertas, independentemente de prazo."""
 
     columns = [
         "aluno_id",
@@ -420,6 +421,7 @@ def build_student_risk_summary(
         "motivo",
         "atividades_atribuidas",
         "entregues",
+        "pendentes",
         "taxa_entrega_geral",
         "taxa_entrega_vencida",
         "pendencias_vencidas",
@@ -444,13 +446,9 @@ def build_student_risk_summary(
         due_rows = rows[rows["atividade_vencida"]]
         overdue_rows = rows[rows["em_atraso"]]
         without_deadline = rows[(rows["sem_prazo"]) & (~rows["entregue"])]
-        alert_rows = overdue_rows
-        if include_without_deadline:
-            # As condições são disjuntas. O id da entrega só é único dentro
-            # de uma atividade; deduplicá-lo aqui apagaria outras pendências.
-            alert_rows = rows[
-                rows["em_atraso"] | (rows["sem_prazo"] & ~rows["entregue"])
-            ]
+        # Cada registro é uma atribuição aluno/atividade. Não deduplicar apenas
+        # pelo id da submissão, que pode se repetir em atividades diferentes.
+        alert_rows = rows[rows["entregue"].eq(False)]
 
         critical = bool(
             not alert_rows.empty
@@ -475,7 +473,7 @@ def build_student_risk_summary(
             reason = "Nenhuma atividade atribuída"
         else:
             level = "Em dia"
-            reason = "Sem pendência vencida"
+            reason = "Todas as atividades atribuídas foram entregues"
 
         last_movement = rows["ultima_atualizacao"].dropna()
         records.append(
@@ -486,6 +484,7 @@ def build_student_risk_summary(
                 "motivo": reason,
                 "atividades_atribuidas": len(rows),
                 "entregues": int(rows["entregue"].sum()) if not rows.empty else 0,
+                "pendentes": pending_for_alert,
                 "taxa_entrega_geral": (
                     float(rows["entregue"].mean() * 100)
                     if not rows.empty
@@ -520,7 +519,7 @@ def build_student_risk_summary(
     result = pd.DataFrame.from_records(records, columns=columns)
     result["_rank"] = result["nivel_risco"].map(rank).fillna(99)
     result = result.sort_values(
-        ["_rank", "pendencias_vencidas", "aluno"],
+        ["_rank", "pendentes", "aluno"],
         ascending=[True, False, True],
     ).drop(columns="_rank")
     return result.reset_index(drop=True)

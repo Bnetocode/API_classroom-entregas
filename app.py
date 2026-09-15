@@ -161,18 +161,35 @@ def _course_label(course: dict[str, Any]) -> str:
     return f"{course['name']} — {section}" if section else str(course["name"])
 
 
+def _with_pending_counts(
+    summary: pd.DataFrame, assignments_column: str = "atribuicoes"
+) -> pd.DataFrame:
+    """Deriva não entregas dos totais, inclusive em resumos de versões anteriores."""
+
+    # A interface pode receber um resumo sem a coluna derivada durante uma
+    # recarga do app. Recalcular também evita reaproveitar contagens por prazo.
+    # assign devolve uma cópia, preservando os dados usados pelas outras abas.
+    return summary.assign(pendentes=summary[assignments_column] - summary["entregues"])
+
+
 def _overview_metrics(
     snapshot: ClassroomSnapshot, data: DashboardData, risks: pd.DataFrame
 ) -> None:
-    due = data.submissions[data.submissions["atividade_vencida"]]
-    delivery_rate = float(due["entregue"].mean() * 100) if not due.empty else pd.NA
+    submissions = data.submissions
+    delivery_rate = (
+        float(submissions["entregue"].mean() * 100) if not submissions.empty else pd.NA
+    )
     risk_count = int(risks["nivel_risco"].isin(RISK_LEVELS).sum()) if not risks.empty else 0
 
     columns = st.columns(5)
     columns[0].metric("Alunos", len(snapshot.students))
     columns[1].metric("Atividades publicadas", len(snapshot.coursework))
-    columns[2].metric("Entrega nas vencidas", _format_percent(delivery_rate))
-    columns[3].metric("Pendências vencidas", int(data.submissions["em_atraso"].sum()))
+    columns[2].metric("Taxa de entrega", _format_percent(delivery_rate))
+    columns[3].metric(
+        "Não entregue",
+        int(submissions["entregue"].eq(False).sum()),
+        help="Quantidade de atividades não entregues por aluno, com ou sem prazo.",
+    )
     columns[4].metric("Alunos em atenção", risk_count)
 
 
@@ -180,7 +197,6 @@ def _render_overview(
     snapshot: ClassroomSnapshot,
     data: DashboardData,
     risks: pd.DataFrame,
-    include_without_deadline: bool = False,
 ) -> None:
     _overview_metrics(snapshot, data, risks)
     st.caption(
@@ -198,14 +214,45 @@ def _render_overview(
     chart_col, status_col = st.columns([3, 2])
     with chart_col:
         st.subheader("Taxa de entrega por etapa")
-        chart = data.module_summary.dropna(subset=["taxa_entrega_vencida"])
+        chart = data.module_summary.dropna(subset=["taxa_entrega_geral"])
         if chart.empty:
-            st.info("Ainda não há atividade com prazo vencido para calcular a taxa.")
+            st.info("Ainda não há atividades atribuídas aos alunos para calcular a taxa.")
         else:
-            st.bar_chart(
-                chart.set_index("etapa")[["taxa_entrega_vencida"]],
-                y_label="% das atribuições vencidas",
-                color="#1f7a5a",
+            st.vega_lite_chart(
+                chart[["etapa", "taxa_entrega_geral"]].rename(
+                    columns={"taxa_entrega_geral": "Taxa de entrega"}
+                ),
+                {
+                    "mark": {"type": "bar", "color": "#1f7a5a"},
+                    "encoding": {
+                        "x": {
+                            "field": "etapa",
+                            "type": "nominal",
+                            "title": "Etapa",
+                            "sort": chart["etapa"].tolist(),
+                        },
+                        "y": {
+                            "field": "Taxa de entrega",
+                            "type": "quantitative",
+                            "title": "% das atividades atribuídas que foram entregues",
+                            "scale": {"domain": [0, 100], "nice": False},
+                            "axis": {
+                                "values": [0, 20, 40, 60, 80, 100],
+                                "labelExpr": "datum.value + '%'",
+                            },
+                        },
+                        "tooltip": [
+                            {"field": "etapa", "type": "nominal", "title": "Etapa"},
+                            {
+                                "field": "Taxa de entrega",
+                                "type": "quantitative",
+                                "title": "Taxa de entrega (%)",
+                                "format": ".2f",
+                            },
+                        ],
+                    },
+                },
+                width="stretch",
             )
 
     with status_col:
@@ -218,20 +265,11 @@ def _render_overview(
         )
         st.bar_chart(status, horizontal=True, color="#dc7f32")
 
-    no_deadline = int(data.activities["sem_prazo"].sum())
-    future = int(
-        ((~data.activities["sem_prazo"]) & (~data.activities["atividade_vencida"])).sum()
+    st.caption(
+        "Taxa de entrega = atividades entregues ÷ atividades atribuídas aos alunos. "
+        "Cada atividade conta uma vez por aluno. Toda não entrega entra nos "
+        "indicadores e alertas, independentemente de prazo."
     )
-    if no_deadline or future:
-        st.info(
-            f"{future} atividade(s) ainda dentro do prazo e {no_deadline} sem prazo "
-            "não reduzem a taxa principal. "
-            + (
-                "Pendências sem prazo estão incluídas nos alertas pela configuração atual."
-                if include_without_deadline
-                else "Essas atividades não geram alerta automático na configuração atual."
-            )
-        )
 
     outside_roster = int(
         data.submissions.loc[
@@ -249,14 +287,14 @@ def _render_risk_tab(
     data: DashboardData,
     risks: pd.DataFrame,
     high_risk_threshold: int = 2,
-    include_without_deadline: bool = False,
 ) -> None:
+    risks = _with_pending_counts(risks, "atividades_atribuidas")
     st.subheader("Lista de intervenção da tutoria")
     st.caption(
         "Alto = quantidade configurada de pendências; Crítico = qualquer pendência "
-        f"elegível detectada na Aula 0/Módulo 1. Parâmetros ativos: alto a partir "
-        f"de {high_risk_threshold} pendência(s); sem prazo "
-        f"{'incluídas' if include_without_deadline else 'excluídas'} dos alertas."
+        f"detectada na Aula 0/Módulo 1. Alto a partir de {high_risk_threshold} "
+        "atividade(s) não entregue(s). Todas as não entregas contam, "
+        "independentemente de prazo."
     )
     selected_levels = st.multiselect(
         "Níveis exibidos",
@@ -275,8 +313,8 @@ def _render_risk_tab(
         "nivel_risco",
         "motivo",
         "entregues",
-        "taxa_entrega_vencida",
-        "pendencias_vencidas",
+        "taxa_entrega_geral",
+        "pendentes",
         "pendencias_sem_prazo",
         "entregas_atrasadas",
         "ultimo_movimento",
@@ -296,7 +334,7 @@ def _render_risk_tab(
             st.info("Nenhum aluno corresponde aos filtros atuais. Ajuste os níveis ou a busca.")
     else:
         table = filtered[display_columns].copy()
-        table["taxa_entrega_vencida"] = table["taxa_entrega_vencida"].map(
+        table["taxa_entrega_geral"] = table["taxa_entrega_geral"].map(
             _format_percent
         )
         table["ultimo_movimento"] = table["ultimo_movimento"].map(_format_datetime)
@@ -309,8 +347,8 @@ def _render_risk_tab(
                 "nivel_risco": "Risco",
                 "motivo": "Motivo",
                 "entregues": "Entregues",
-                "taxa_entrega_vencida": "Taxa vencidas",
-                "pendencias_vencidas": "Pendências vencidas",
+                "taxa_entrega_geral": "Taxa de entrega",
+                "pendentes": "Não entregue",
                 "pendencias_sem_prazo": "Sem prazo",
                 "entregas_atrasadas": "Entregas atrasadas",
                 "ultimo_movimento": "Último movimento",
@@ -366,12 +404,9 @@ def _render_activities_tab(data: DashboardData, drop_threshold: int) -> None:
         "manter somente os três escopos OAuth já configurados."
     )
 
-    modules = data.module_summary.copy()
+    modules = _with_pending_counts(data.module_summary)
     if not modules.empty:
         modules["taxa_entrega_geral"] = modules["taxa_entrega_geral"].map(
-            _format_percent
-        )
-        modules["taxa_entrega_vencida"] = modules["taxa_entrega_vencida"].map(
             _format_percent
         )
         modules["variacao_pp"] = modules["variacao_pp"].map(
@@ -382,11 +417,10 @@ def _render_activities_tab(data: DashboardData, drop_threshold: int) -> None:
                 [
                     "etapa",
                     "atividades",
-                    "atividades_vencidas",
-                    "atribuicoes_vencidas",
-                    "entregues_vencidas",
-                    "pendencias_vencidas",
-                    "taxa_entrega_vencida",
+                    "atribuicoes",
+                    "entregues",
+                    "pendentes",
+                    "taxa_entrega_geral",
                     "variacao_pp",
                 ]
             ],
@@ -395,11 +429,10 @@ def _render_activities_tab(data: DashboardData, drop_threshold: int) -> None:
             column_config={
                 "etapa": "Etapa",
                 "atividades": "Atividades",
-                "atividades_vencidas": "Vencidas",
-                "atribuicoes_vencidas": "Atribuições vencidas",
-                "entregues_vencidas": "Entregues",
-                "pendencias_vencidas": "Pendências",
-                "taxa_entrega_vencida": "Taxa de entrega",
+                "atribuicoes": "Atribuições",
+                "entregues": "Entregues",
+                "pendentes": "Não entregue",
+                "taxa_entrega_geral": "Taxa de entrega",
                 "variacao_pp": "Variação",
             },
         )
@@ -413,15 +446,12 @@ def _render_activities_tab(data: DashboardData, drop_threshold: int) -> None:
                 "Revisar clareza, carga e comunicação do módulo."
             )
 
-    activities = data.activity_summary.copy()
+    activities = _with_pending_counts(data.activity_summary)
     if activities.empty:
         st.info("Nenhuma atividade publicada.")
         return
     activities["prazo"] = activities["prazo"].map(_format_datetime)
     activities["taxa_entrega_geral"] = activities["taxa_entrega_geral"].map(
-        _format_percent
-    )
-    activities["taxa_entrega_vencida"] = activities["taxa_entrega_vencida"].map(
         _format_percent
     )
     st.dataframe(
@@ -432,9 +462,9 @@ def _render_activities_tab(data: DashboardData, drop_threshold: int) -> None:
                 "prazo",
                 "atribuicoes",
                 "entregues",
-                "pendencias_vencidas",
+                "pendentes",
                 "entregas_atrasadas",
-                "taxa_entrega_vencida",
+                "taxa_entrega_geral",
                 "link",
             ]
         ],
@@ -446,9 +476,9 @@ def _render_activities_tab(data: DashboardData, drop_threshold: int) -> None:
             "prazo": "Prazo (Recife)",
             "atribuicoes": "Atribuições",
             "entregues": "Entregues",
-            "pendencias_vencidas": "Pendências vencidas",
+            "pendentes": "Não entregue",
             "entregas_atrasadas": "Entregas atrasadas",
-            "taxa_entrega_vencida": "Taxa vencidas",
+            "taxa_entrega_geral": "Taxa de entrega",
             "link": st.column_config.LinkColumn("Classroom", display_text="Abrir"),
         },
     )
@@ -511,7 +541,6 @@ def _render_dashboard_fragment(
     auth_cache_key: str,
     auth_mode: str,
     high_risk_threshold: int,
-    include_without_deadline: bool,
     drop_threshold: int,
 ) -> None:
     fallback_key = f"last_good_snapshot:{auth_cache_key}:{course_id}"
@@ -540,7 +569,6 @@ def _render_dashboard_fragment(
         data,
         snapshot.students,
         high_risk_threshold=high_risk_threshold,
-        include_without_deadline=include_without_deadline,
     )
     recognized_mask = data.activities["etapa"].map(is_recognized_stage).astype(bool)
     unrecognized = data.activities[~recognized_mask]
@@ -556,13 +584,12 @@ def _render_dashboard_fragment(
         ["Visão geral", "Alunos em atenção", "Módulos e atividades", "Diagnóstico"]
     )
     with overview:
-        _render_overview(snapshot, data, risks, include_without_deadline)
+        _render_overview(snapshot, data, risks)
     with risk:
         _render_risk_tab(
             data,
             risks,
             high_risk_threshold,
-            include_without_deadline,
         )
     with activities:
         _render_activities_tab(data, drop_threshold)
@@ -604,7 +631,7 @@ def main() -> None:
 
     st.title("Acompanhamento do Google Classroom")
     st.caption(
-        "Curso Os 4D's do Negócio · entregas, atrasos e sinais objetivos de risco"
+        "Curso Os 4D's do Negócio · entregas, não entregas e sinais objetivos de risco"
     )
     if not courses:
         st.error(
@@ -632,14 +659,6 @@ def main() -> None:
             max_value=5,
             value=2,
             help="Aula 0/Módulo 1 continua crítica já na primeira pendência.",
-        )
-        include_without_deadline = st.toggle(
-            "Incluir atividades sem prazo nos alertas",
-            value=False,
-            help=(
-                "Desativado por padrão para não classificar como atraso uma atividade "
-                "sem data objetiva."
-            ),
         )
         drop_threshold = st.slider(
             "Queda coletiva mínima (p.p.)",
@@ -674,7 +693,6 @@ def main() -> None:
         auth_cache_key,
         auth_mode,
         high_risk_threshold,
-        include_without_deadline,
         drop_threshold,
     )
 

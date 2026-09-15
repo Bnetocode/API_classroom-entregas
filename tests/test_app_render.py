@@ -45,6 +45,18 @@ def render_full_app(snapshot, auth_mode: str = "local") -> None:
     def record_refresh(*args):
         st.session_state["refreshed_snapshot"] = args
 
+    original_bar_chart = st.bar_chart
+    original_vega_lite_chart = st.vega_lite_chart
+    st.session_state["rendered_charts"] = []
+
+    def record_chart(data, **kwargs):
+        st.session_state["rendered_charts"].append(data.copy())
+        return original_bar_chart(data, **kwargs)
+
+    def record_vega_chart(data, spec, **kwargs):
+        st.session_state["rendered_charts"].append(data.copy())
+        return original_vega_lite_chart(data, spec, **kwargs)
+
     courses = [
         {
             "id": snapshot.course["id"],
@@ -54,6 +66,8 @@ def render_full_app(snapshot, auth_mode: str = "local") -> None:
         }
     ]
     with (
+        patch.object(app.st, "bar_chart", side_effect=record_chart),
+        patch.object(app.st, "vega_lite_chart", side_effect=record_vega_chart),
         patch.object(app, "_resolve_auth_mode", return_value=(auth_mode, "test")),
         patch.object(app, "_cached_courses", return_value=courses),
         patch.object(app, "_cached_snapshot", side_effect=fetch_snapshot) as cached_snapshot,
@@ -85,6 +99,92 @@ def render_auth_connection_failure() -> None:
 
 
 class AppRenderTests(unittest.TestCase):
+    def test_summaries_without_pending_column_render_using_assignment_totals(self) -> None:
+        snapshot = sample_snapshot()
+        data = build_dashboard_data(snapshot, now=NOW)
+        risks = build_student_risk_summary(data, snapshot.students)
+        for missing_from in ("module_summary", "activity_summary", "risks"):
+            with self.subTest(missing_from=missing_from):
+                old_data = data
+                old_risks = risks
+                if missing_from == "risks":
+                    old_risks = risks.drop(columns="pendentes")
+                else:
+                    old_data = replace(data, **{
+                        missing_from: getattr(data, missing_from).drop(columns="pendentes")
+                    })
+                app_test = AppTest.from_function(
+                    render_fixture, args=(snapshot, old_data, old_risks)
+                ).run()
+                self.assertEqual(len(app_test.exception), 0)
+                for table in app_test.dataframe:
+                    self.assertEqual(table.value["pendentes"].sum(), 3)
+                modules = next(table.value for table in app_test.dataframe
+                               if "variacao_pp" in table.value)
+                self.assertEqual(modules["taxa_entrega_geral"].tolist(),
+                                 ["50,0%", "50,0%", "50,0%"])
+                original = old_risks if missing_from == "risks" else getattr(old_data, missing_from)
+                self.assertNotIn("pendentes", original.columns)
+
+    def test_five_no_deadline_activities_have_consistent_rates_and_counts(self) -> None:
+        snapshot = sample_snapshot()
+        snapshot = replace(
+            snapshot,
+            coursework=[{"id": str(i), "title": f"Módulo {i + 2}"} for i in range(5)],
+            submissions=[
+                {"id": f"{i}-{user}", "courseWorkId": str(i), "userId": user,
+                 "state": ("RETURNED" if user == "alice" else "TURNED_IN")
+                 if i == 0 or (i == 1 and user == "alice") else "CREATED"}
+                for i in range(5) for user in ("alice", "bob")
+            ],
+        )
+        app_test = AppTest.from_function(render_full_app, args=(snapshot,)).run()
+        self.assertEqual(len(app_test.exception), 0)
+        metrics = {metric.label: metric.value for metric in app_test.metric}
+        self.assertEqual(metrics["Atividades publicadas"], "5")
+        self.assertEqual(metrics["Não entregue"], "7")
+        self.assertEqual(metrics["Taxa de entrega"], "30,0%")
+        self.assertEqual(metrics["Alunos em atenção"], "2")
+        tables = [table.value for table in app_test.dataframe]
+        for table in tables:
+            self.assertEqual(table["pendentes"].sum(), 7)
+            self.assertEqual(table["entregues"].sum(), 3)
+            self.assertNotIn("taxa_entrega_vencida", table.columns)
+        modules = next(table for table in tables if "variacao_pp" in table)
+        self.assertEqual(modules["taxa_entrega_geral"].tolist(),
+                         ["100,0%", "50,0%", "0,0%", "0,0%", "0,0%"])
+        chart, situations = app_test.session_state["rendered_charts"]
+        self.assertEqual(chart["Taxa de entrega"].tolist(), [100, 50, 0, 0, 0])
+        self.assertEqual(situations.loc["Sem prazo — revisão manual", "quantidade"], 7)
+        self.assertTrue(any("Sinal coletivo" in item.value for item in app_test.warning))
+
+    def test_mixed_deadlines_use_all_assignments_in_overview(self) -> None:
+        snapshot = sample_snapshot()
+        snapshot = replace(snapshot, submissions=[
+            dict(item, state="CREATED") if item["id"] == "s3" else item
+            for item in snapshot.submissions
+        ])
+        app_test = AppTest.from_function(render_full_app, args=(snapshot,)).run()
+        self.assertEqual(len(app_test.exception), 0)
+        metrics = {metric.label: metric.value for metric in app_test.metric}
+        self.assertEqual(metrics["Taxa de entrega"], "33,3%")
+        self.assertEqual(metrics["Não entregue"], "4")
+
+    def test_rates_for_all_delivered_all_pending_and_no_assignments(self) -> None:
+        for state, rate, pending in (("TURNED_IN", "100,0%", "0"),
+                                     ("CREATED", "0,0%", "6"),
+                                     (None, "—", "0")):
+            with self.subTest(state=state):
+                snapshot = sample_snapshot()
+                snapshot = replace(snapshot, submissions=[
+                    dict(item, state=state) for item in snapshot.submissions
+                ] if state else [])
+                app_test = AppTest.from_function(render_full_app, args=(snapshot,)).run()
+                self.assertEqual(len(app_test.exception), 0)
+                metrics = {metric.label: metric.value for metric in app_test.metric}
+                self.assertEqual(metrics["Taxa de entrega"], rate)
+                self.assertEqual(metrics["Não entregue"], pending)
+
     def test_dashboard_components_render_without_exception(self) -> None:
         snapshot = sample_snapshot()
         data = build_dashboard_data(snapshot, now=NOW)
@@ -191,7 +291,7 @@ class AppRenderTests(unittest.TestCase):
                 else:
                     self.assertTrue(any("não tem alunos" in item.value for item in app_test.info))
 
-    def test_without_deadline_toggle_updates_risk_and_explanation(self) -> None:
+    def test_no_deadline_counts_in_metrics_and_risk_without_toggle(self) -> None:
         snapshot = sample_snapshot()
         snapshot = replace(
             snapshot,
@@ -202,12 +302,15 @@ class AppRenderTests(unittest.TestCase):
             ],
         )
         app_test = AppTest.from_function(render_full_app, args=(snapshot,)).run()
-        self.assertTrue(any("Nenhum aluno em atenção" in item.value for item in app_test.success))
-        app_test.toggle[0].set_value(True).run()
+        self.assertEqual(len(app_test.toggle), 0)
+        metrics = {metric.label: metric.value for metric in app_test.metric}
+        self.assertEqual(metrics["Taxa de entrega"], "50,0%")
+        self.assertEqual(metrics["Não entregue"], "1")
         self.assertEqual(len(app_test.exception), 0)
         risk_table = next(table.value for table in app_test.dataframe if "nivel_risco" in table.value)
         self.assertEqual(risk_table["nivel_risco"].tolist(), ["Atenção"])
-        self.assertTrue(any("Pendências sem prazo estão incluídas" in item.value for item in app_test.info))
+        self.assertTrue(any("independentemente de prazo" in item.value for item in app_test.caption))
+        self.assertFalse(any("prazo vencido" in item.value or "não reduzem" in item.value for item in app_test.info))
         app_test.slider[0].set_value(1).run()
         risk_table = next(table.value for table in app_test.dataframe if "nivel_risco" in table.value)
         self.assertEqual(risk_table["nivel_risco"].tolist(), ["Alto"])
