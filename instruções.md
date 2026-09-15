@@ -45,9 +45,9 @@ Nos demais comandos deste manual, no Windows substitua `.venv/bin/python` por
 `.\.venv\Scripts\python.exe`.
 
 Nas execuções seguintes, com o ambiente já criado e as dependências instaladas,
-normalmente basta executar o terceiro comando. A primeira conexão completa
-também requer `credentials.json`; a configuração segura desse arquivo está
-explicada em **Reconstruir o ambiente local do zero**.
+normalmente basta executar o terceiro comando. Sem Secrets Google, a primeira
+conexão local requer `credentials.json`; veja **Reconstruir o ambiente local do zero**.
+Com Secrets, use o fluxo Web descrito em **Publicar no Streamlit Community Cloud**.
 
 ## Visão geral do funcionamento
 
@@ -71,7 +71,12 @@ Google Classroom API <── classroom_client.py <──────┘
              painel Streamlit
 ```
 
-No fluxo local:
+O painel prioriza `[google_credentials]` nos Secrets e aceita `[google_oauth]`
+como alternativa legada. A presença de uma dessas seções seleciona o fluxo em
+memória, inclusive no localhost. Uma seção incompleta gera orientação de
+configuração; não usa silenciosamente a conta de um arquivo local.
+
+No fluxo local, sem seção Google nos Secrets:
 
 1. `app.py` tenta carregar `token.json`.
 2. Se o token estiver válido, ele é reutilizado sem abrir o Google.
@@ -94,7 +99,8 @@ Nenhum e-mail fica fixado no projeto.
 | `README.md` | Apresentação do propósito, das funcionalidades e do uso do site. |
 | `instruções.md` | Manual técnico de instalação, testes, publicação, recuperação e continuidade. |
 | `app.py` | Interface Streamlit, seleção de turma, filtros, mensagens de autenticação, cache e troca de conta. |
-| `classroom_client.py` | OAuth, caminhos absolutos, persistência e renovação do token, chamadas paginadas e coleta mínima da Classroom API. |
+| `classroom_client.py` | Credenciais OAuth, fallback local, renovação, chamadas paginadas e coleta mínima da Classroom API. |
+| `classroom_oauth.py` | Leitura dos Secrets, OAuth Web com PKCE e validação de state, passagem temporária do código entre abas. |
 | `analytics.py` | Normalização de prazos para `America/Recife`, inferência de etapas, taxas e classificação dos sinais de risco. |
 | `anexo_api_classroom_etapas_1a5.py` | Execução opcional pelo terminal para validar a API e gerar um CSV pontual. |
 | `provision_cloud_token.py` | Provisionamento separado do refresh token de um cliente Web para o Streamlit Community Cloud, com a mesma validação estrita da resposta OAuth. |
@@ -290,31 +296,20 @@ Secrets do aplicativo.
 
 ### Trocar a conta fixa do Classroom no Community Cloud
 
-Não é necessário alterar o código, o endereço do site ou fazer outro deploy.
-Usando o mesmo `credentials_web.json`, faça o seguinte:
+Na versão com OAuth Web pelo painel:
 
 1. se o OAuth estiver em **External / Testing**, adicione a nova conta em
    **Google Auth Platform > Audience > Test users**;
-2. execute localmente:
-
-```bash
-.venv/bin/python provision_cloud_token.py
-```
-
-3. na página oficial do Google, escolha **Usar outra conta**, selecione a nova
+2. nos Secrets, deixe `refresh_token = ""` e preserve `client_id`,
+   `client_secret` e `token_uri` do mesmo cliente Web;
+3. abra o painel, clique em **Conectar ao Google Classroom**, escolha a nova
    conta docente e conclua o consentimento;
-4. aguarde a criação do novo `token_cloud.json`;
-5. em **Streamlit Community Cloud > aplicativo > Settings > Secrets**, troque
-   somente o valor de `refresh_token` na seção `[google_oauth]`;
-6. mantenha os valores atuais de `client_id`, `client_secret` e `token_uri`;
-7. salve os Secrets e reinicie o aplicativo se isso não ocorrer
-   automaticamente.
+4. volte à aba original e copie o novo token exibido para `refresh_token`;
+5. salve os Secrets e reinicie o app se necessário.
 
-O `token_uri` continuará normalmente como
-`https://oauth2.googleapis.com/token`. Todos os visitantes autorizados passarão
-a ver as turmas da nova conta, pois `teacherId="me"` agora representa essa
-conta. Somente se outro cliente OAuth Web for criado será necessário substituir
-também `client_id` e `client_secret`.
+Use `[google_credentials]`; `[google_oauth]` também funciona na configuração
+legada. Todos os visitantes passam a usar a conta correspondente ao token
+configurado. O fluxo não muda o login/senha de acesso ao app.
 
 Se apenas novas turmas forem adicionadas à conta que já está conectada, não
 gere outro token. Aguarde até 10 minutos pelo cache da lista de turmas ou
@@ -395,7 +390,8 @@ Para validar a integração e gerar uma exportação pontual:
 .venv/bin/python anexo_api_classroom_etapas_1a5.py
 ```
 
-O script reutiliza `token.json`, lista as turmas de `teacherId="me"`, pede a
+O script prioriza os Secrets Google; sem eles, reutiliza `token.json`. Lista
+as turmas de `teacherId="me"`, pede a
 seleção pelo número e gera `entregas_classroom.csv`.
 
 O CSV pode conter nomes e situação acadêmica. Ele está no `.gitignore`, mas
@@ -488,56 +484,86 @@ esses acessos compartilhando senhas pessoais.
 
 ## Publicar no Streamlit Community Cloud
 
-O localhost e o Cloud usam clientes OAuth separados:
+### Configurar e autorizar pelo painel
 
-| Ambiente | Cliente | Arquivo local | Callback |
-| --- | --- | --- | --- |
-| Streamlit local | Desktop app | `credentials.json` | `http://localhost:<porta-dinâmica>/` |
-| Provisionamento Cloud | Web application | `credentials_web.json` | `http://localhost:8080/` |
+O cliente usado pelos Secrets deve ser **Web application**. Cadastre a URL
+exata do app em **Authorized redirect URIs** no Google Cloud, por exemplo
+`https://api-classroom-entregas.streamlit.app/`, incluindo a barra final.
+O Google exige correspondência exata do endereço
+([documentação OAuth Web](https://developers.google.com/identity/protocols/oauth2/web-server)).
 
-Não misture os dois fluxos.
-
-Antes de publicar, envie ao GitHub somente os arquivos versionados. No
-Community Cloud, selecione `app.py` como entrypoint, use Python 3.12 em
-**Advanced settings** e mantenha o aplicativo privado.
-
-Para provisionar a conta fixa do Cloud:
-
-1. crie outro cliente OAuth do tipo **Web application** no mesmo projeto;
-2. adicione exatamente `http://localhost:8080/` em **Authorized redirect URIs**;
-3. baixe o JSON como `credentials_web.json` para a raiz do projeto;
-4. execute:
-
-```bash
-.venv/bin/python provision_cloud_token.py
-```
-
-5. autorize manualmente a conta docente;
-6. copie de `token_cloud.json` apenas os valores necessários para o Secrets do
-   Streamlit, seguindo `.streamlit/secrets.toml.example`:
+No Community Cloud, selecione `app.py` como entrypoint e Python 3.12. Configure
+**Settings > Secrets** conforme `.streamlit/secrets.toml.example`:
 
 ```toml
-[google_oauth]
+[google_credentials]
 client_id = "..."
 client_secret = "..."
-refresh_token = "..."
+refresh_token = ""
 token_uri = "https://oauth2.googleapis.com/token"
 ```
 
-`client_id`, `client_secret` e `refresh_token` precisam pertencer ao mesmo
-cliente Web.
+O campo `refresh_token` pode estar vazio, conter apenas espaços ou ser omitido
+na primeira conexão. Os demais campos pertencem ao mesmo cliente Web.
+`token_uri` pode ser omitido para usar o endpoint padrão do Google. A URL de
+retorno é detectada por `st.context.url`; opcionalmente configure
+`redirect_uri = "https://api-classroom-entregas.streamlit.app/"` na mesma seção.
 
-O retorno `localhost:8080` é usado somente durante o provisionamento feito pelo
-responsável. Depois disso, o Cloud renova o token já emitido e não apresenta
-login Google aos visitantes. Antes de salvar `token_cloud.json`, o provisionador
-também exige credenciais válidas, refresh token e o conjunto exato de escopos.
+1. Abra o painel e clique em **Conectar ao Google Classroom**.
+2. Mantenha a aba original aberta enquanto autoriza na outra aba.
+3. Depois do consentimento, o Google retorna ao app. Feche essa segunda aba
+   quando aparecer a instrução de voltar à original.
+4. A aba original detecta o retorno automaticamente e exibe o `refresh_token`
+   em um bloco copiável, com a instrução para atualizar os Secrets.
+5. Copie o valor, cole manualmente em `refresh_token` e salve os Secrets.
+6. Abra uma nova sessão: a conta será autenticada por renovação do token,
+   sem novo consentimento. O valor configurado não é mostrado aos visitantes.
+
+O fluxo, o verificador PKCE e as credenciais ficam na memória da sessão que
+iniciou a autorização. Apenas o código OAuth de uso único passa entre as abas,
+com validação de `state` e limite de dez minutos. Não há gravação de token,
+`credentials.json`, `token.json` ou alteração automática dos Secrets nesse modo.
+A atualização automática entre abas ocorre a cada dois segundos. Se a sessão
+original ou o processo reiniciar antes da conclusão, conecte novamente.
+
+A seção legada `[google_oauth]` segue aceita. Se as duas existirem,
+`[google_credentials]` tem prioridade; não há mistura de campos. Secrets
+incompletos geram uma orientação, sem recorrer a arquivos de outra conta.
+Sem nenhuma seção Google, o app usa o fluxo Desktop local existente com
+`credentials.json` e `token.json`. Secrets de senha do app não participam dessa
+escolha. OAuth do Classroom é separado do controle de acesso ao painel.
+
+Para testar o modo Secrets localmente, coloque a mesma seção em
+`.streamlit/secrets.toml`, use um cliente Web e cadastre o endereço mostrado
+pelo painel, por exemplo `http://localhost:8501/`. Nesse modo também não há
+gravação de tokens. O anexo CLI prioriza os mesmos Secrets; se ainda faltar
+o token, orienta concluir a autorização no painel.
+
+### Alternativa local legada
+
+`provision_cloud_token.py` continua disponível como ferramenta local opcional.
+Ela usa um cliente Web em `credentials_web.json`, com retorno registrado em
+`http://localhost:8080/`, e grava `token_cloud.json` localmente com permissão
+0600. Essa ferramenta não é chamada pelo painel nem necessária para o novo
+fluxo Cloud. Não publique esses arquivos no GitHub.
+
+### Validação do fluxo
+
+A suíte `tests/test_cloud_oauth.py` usa a biblioteca OAuth instalada, respostas
+HTTP sintéticas e sessões separadas de `AppTest`. Verifica ausência/valor vazio
+do token, autorização, retorno em outra aba, exibição restrita do token gerado,
+renovação em nova sessão com token configurado, erros, expiração, PKCE e state.
+
+Para a validação real, repita os seis passos acima com o cliente Web cadastrado.
+Esse teste depende do consentimento manual no Google; a suíte automatizada não
+comprova a configuração do Console Google nem os Secrets da implantação remota.
 
 ### Limite do modo Testing
 
 Autorizações de aplicativos **External / Testing** expiram em sete dias,
 inclusive o refresh token. Enquanto o aplicativo continuar em Testing, será
-necessário executar novamente `provision_cloud_token.py` e atualizar o Secrets
-quando o token expirar.
+necessário limpar `refresh_token`, autorizar novamente pelo painel e atualizar
+os Secrets quando o token expirar.
 
 Para operação duradoura, avalie publicar o aplicativo OAuth em produção e
 seguir o processo de verificação exigido para os escopos utilizados. Depois da
@@ -546,6 +572,10 @@ mudança, gere um token novo.
 ## Diagnóstico de problemas comuns
 
 ### O callback conclui, mas não existe `token.json` ou `token_cloud.json`
+
+No modo Secrets isso é esperado: o token aparece na aba original e não é
+gravado em disco. Copie-o manualmente para os Secrets. As orientações abaixo
+se aplicam apenas ao fallback Desktop e ao provisionador local legado.
 
 A página confirma apenas a chegada do callback. Verifique o erro seguro no
 terminal e confirme as versões de `requirements.txt`. O código atual já trata

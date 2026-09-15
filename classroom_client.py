@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping
 from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow, InstalledAppFlow
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 from httplib2 import HttpLib2Error
@@ -116,7 +116,7 @@ def _credentials_have_required_scopes(credentials: Credentials) -> bool:
 
 
 def recover_equivalent_scope_credentials(
-    flow: InstalledAppFlow, scope_warning: Warning
+    flow: Flow, scope_warning: Warning
 ) -> Credentials:
     """Recupera o token emitido apenas para o mapeamento observado do Classroom."""
 
@@ -298,10 +298,14 @@ def authorize_local_account(
         _LOCAL_OAUTH_LOCK.release()
 
 
-def credentials_from_cloud_secrets(secret: Mapping[str, Any]) -> Credentials:
-    """Monta credenciais da conta fixa guardadas no Secrets do Streamlit."""
+def validate_cloud_secrets(
+    secret: Mapping[str, Any], *, require_refresh_token: bool = False
+) -> None:
+    """Valida o cliente antes do consentimento; o token inicial é opcional."""
 
-    required = ("client_id", "client_secret", "refresh_token")
+    required = ("client_id", "client_secret")
+    if require_refresh_token:
+        required += ("refresh_token",)
     missing = [
         key
         for key in required
@@ -311,9 +315,22 @@ def credentials_from_cloud_secrets(secret: Mapping[str, Any]) -> Credentials:
     ]
     if missing:
         raise ClassroomConfigurationError(
-            "Secrets incompletos em [google_oauth]: " + ", ".join(missing)
+            "Secrets incompletos em [google_credentials] (ou [google_oauth]): "
+            + ", ".join(missing)
         )
 
+    if secret.get("token_uri", "https://oauth2.googleapis.com/token") != (
+        "https://oauth2.googleapis.com/token"
+    ):
+        raise ClassroomConfigurationError(
+            "token_uri deve ser https://oauth2.googleapis.com/token."
+        )
+
+
+def credentials_from_cloud_secrets(secret: Mapping[str, Any]) -> Credentials:
+    """Monta e renova credenciais em memória, sem ler ou gravar arquivos."""
+
+    validate_cloud_secrets(secret, require_refresh_token=True)
     credentials = Credentials(
         token=None,
         refresh_token=secret["refresh_token"].strip(),

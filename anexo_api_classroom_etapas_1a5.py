@@ -20,18 +20,28 @@ from classroom_client import (
     authorize_local_account,
     build_classroom_service,
     collect_course_snapshot,
+    credentials_from_cloud_secrets,
     list_teacher_courses,
     load_local_credentials,
 )
+
+from classroom_oauth import read_google_secrets
 
 
 OUTPUT_PATH = Path(__file__).resolve().parent / "entregas_classroom.csv"
 
 
-# %% Célula 1 — Autenticação local
+# %% Célula 1 — Autenticação
 def autenticar():
-    """Reaproveita token.json ou abre o Google no primeiro acesso."""
+    """Prioriza Secrets; sem configuração Google, mantém o fluxo Desktop local."""
 
+    secret = read_google_secrets()
+    if secret is not None:
+        if not str(secret.get("refresh_token", "")).strip():
+            raise ClassroomAuthenticationRequired(
+                "Abra o painel Streamlit para autorizar e copie o refresh_token para os Secrets."
+            )
+        return credentials_from_cloud_secrets(secret)
     try:
         return load_local_credentials()
     except ClassroomAuthenticationRequired:

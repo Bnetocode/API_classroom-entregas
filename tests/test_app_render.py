@@ -90,7 +90,7 @@ def render_auth_connection_failure() -> None:
     from classroom_client import ClassroomAPIError
 
     with (
-        patch.object(app, "_secret_section", return_value={}),
+        patch.object(app, "read_google_secrets", return_value=None),
         patch.object(app, "load_local_credentials", side_effect=ClassroomAPIError("Sem conexão.")),
         patch.object(app, "authorize_local_account") as authorize,
     ):

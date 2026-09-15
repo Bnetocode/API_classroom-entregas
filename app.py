@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pandas as pd
@@ -29,6 +30,14 @@ from classroom_client import (
     list_teacher_courses,
     load_local_credentials,
     local_auth_cache_key,
+    validate_cloud_secrets,
+)
+from classroom_oauth import (
+    AUTHORIZATION_TTL,
+    OAuthCallbackMailbox,
+    finish_cloud_authorization,
+    read_google_secrets,
+    start_cloud_authorization,
 )
 
 
@@ -37,19 +46,110 @@ COURSE_CACHE_SECONDS = 10 * 60
 RISK_LEVELS = {"Crítico — início", "Alto", "Atenção"}
 
 
-def _secret_section(name: str) -> dict[str, Any]:
-    try:
-        if name in st.secrets:
-            return dict(st.secrets[name])
-    except (FileNotFoundError, KeyError, TypeError):
-        pass
-    return {}
+@st.cache_resource(show_spinner=False)
+def _oauth_mailbox() -> OAuthCallbackMailbox:
+    return OAuthCallbackMailbox()
+
+
+def _effective_cloud_secret(secret: dict[str, Any]) -> dict[str, Any]:
+    credentials = st.session_state.get("classroom_cloud_credentials")
+    if not secret.get("refresh_token", "").strip() and credentials is not None:
+        return {**secret, "refresh_token": credentials.refresh_token}
+    return secret
 
 
 def _credentials_for_mode(auth_mode: str):
     if auth_mode == "cloud":
-        return credentials_from_cloud_secrets(_secret_section("google_oauth"))
+        secret = read_google_secrets()
+        if secret is None:
+            raise ClassroomConfigurationError("Configure [google_credentials] nos Secrets.")
+        return credentials_from_cloud_secrets(_effective_cloud_secret(secret))
     return load_local_credentials()
+
+
+def _handle_cloud_callback() -> bool:
+    if not any(key in st.query_params for key in ("code", "error")):
+        return False
+    response = {key: st.query_params[key] for key in ("state", "code", "error")
+                if key in st.query_params}
+    accepted = _oauth_mailbox().deliver(response)
+    for key in ("state", "code", "error", "error_description", "scope", "authuser", "prompt"):
+        st.query_params.pop(key, None)
+    st.title("Conectar ao Google Classroom")
+    if accepted:
+        st.info("Retorno do Google recebido. Feche esta aba e volte à aba original do painel.")
+    else:
+        st.warning("Esta autorização expirou ou já foi recebida. Volte à aba original e conecte novamente.")
+    return True
+
+
+@st.fragment(run_every=2)
+def _wait_cloud_authorization() -> None:
+    pending = st.session_state.get("classroom_cloud_pending")
+    if pending is None:
+        return
+    response = _oauth_mailbox().take(pending.state)
+    if response is not None:
+        st.session_state.pop("classroom_cloud_pending", None)
+        try:
+            credentials = finish_cloud_authorization(pending, response)
+        except (ClassroomAPIError, ClassroomAuthenticationRequired) as exc:
+            st.session_state["classroom_cloud_error"] = str(exc)
+        else:
+            st.session_state["classroom_cloud_credentials"] = credentials
+            st.session_state["classroom_show_refresh_token"] = True
+        st.rerun()
+    if time.monotonic() - pending.created_at >= AUTHORIZATION_TTL:
+        st.warning("O tempo de autorização terminou. Clique em Reiniciar autorização.")
+    else:
+        st.caption("Aguardando o consentimento Google na outra aba…")
+        st.button("Já autorizei; verificar retorno")
+
+
+def _render_cloud_authorization(secret: dict[str, Any]) -> None:
+    st.title("Conectar ao Google Classroom")
+    st.write("Autorize a conta docente para consultar as turmas do Google Classroom.")
+    # st.context.url vem do endereço público visto pelo navegador, sem query.
+    redirect_uri = secret.get("redirect_uri") or st.context.url
+    if not redirect_uri:
+        raise ClassroomConfigurationError(
+            "Configure redirect_uri em [google_credentials] com a URL do app."
+        )
+    st.caption("No cliente OAuth Web do Google, cadastre este URI de redirecionamento autorizado:")
+    st.code(redirect_uri, language=None)
+    if message := st.session_state.pop("classroom_cloud_error", None):
+        st.error(message)
+    pending = st.session_state.get("classroom_cloud_pending")
+    if pending is not None and st.button("Reiniciar autorização"):
+        _oauth_mailbox().discard(pending.state)
+        st.session_state.pop("classroom_cloud_pending", None)
+        pending = None
+    if pending is None:
+        pending = start_cloud_authorization(secret, redirect_uri)
+        _oauth_mailbox().register(pending)
+        st.session_state["classroom_cloud_pending"] = pending
+    st.link_button("Conectar ao Google Classroom", pending.url, type="primary")
+    st.info(
+        "Mantenha esta aba aberta. O Google abrirá em outra aba; depois de autorizar, "
+        "volte aqui. O refresh_token aparecerá para você copiar para os Secrets."
+    )
+    _wait_cloud_authorization()
+
+
+def _show_generated_refresh_token() -> None:
+    credentials = st.session_state.get("classroom_cloud_credentials")
+    if credentials is None or not st.session_state.get("classroom_show_refresh_token"):
+        return
+    st.success("Google Classroom conectado.")
+    st.info(
+        "Copie esse token e cole no campo refresh_token dos Secrets do Streamlit Cloud "
+        "para não precisar logar novamente. Ele não foi salvo em arquivo nem nos Secrets; "
+        "fica apenas na memória desta sessão."
+    )
+    st.code(credentials.refresh_token, language=None)
+    if st.button("Já copiei; ocultar token"):
+        st.session_state["classroom_show_refresh_token"] = False
+        st.rerun()
 
 
 @st.cache_data(ttl=COURSE_CACHE_SECONDS, show_spinner=False)
@@ -116,25 +216,31 @@ def _render_local_authorization(error_message: str | None = None) -> None:
 
 
 def _resolve_auth_mode() -> tuple[str, str] | None:
-    cloud_secret = _secret_section("google_oauth")
-    if cloud_secret:
-        try:
-            cache_key = cloud_auth_cache_key(cloud_secret)
-            # A validação real do refresh token ocorre na primeira consulta.
-            missing = [
-                key
-                for key in ("client_id", "client_secret", "refresh_token")
-                if not str(cloud_secret.get(key, "")).strip()
-                or str(cloud_secret.get(key, "")).strip().startswith("SEU_")
-            ]
-            if missing:
-                raise ClassroomConfigurationError(
-                    "Secrets incompletos: " + ", ".join(missing)
-                )
-            return "cloud", cache_key
-        except ClassroomConfigurationError as exc:
-            st.error(str(exc))
-            st.stop()
+    cloud_secret = read_google_secrets()
+    if cloud_secret is not None:
+        validate_cloud_secrets(cloud_secret)
+        refresh_token = cloud_secret.get("refresh_token", "")
+        if not isinstance(refresh_token, str):
+            raise ClassroomConfigurationError("refresh_token deve ser texto ou ficar vazio.")
+        if refresh_token.strip():
+            validate_cloud_secrets(cloud_secret, require_refresh_token=True)
+        config_key = (
+            cloud_auth_cache_key(cloud_secret), cloud_secret.get("redirect_uri")
+        )
+        if st.session_state.get("classroom_cloud_config") != config_key:
+            pending = st.session_state.pop("classroom_cloud_pending", None)
+            if pending is not None:
+                _oauth_mailbox().discard(pending.state)
+            for key in ("classroom_cloud_credentials", "classroom_show_refresh_token",
+                        "classroom_cloud_error"):
+                st.session_state.pop(key, None)
+            st.session_state["classroom_cloud_config"] = config_key
+        effective_secret = _effective_cloud_secret(cloud_secret)
+        if not effective_secret.get("refresh_token", "").strip():
+            _render_cloud_authorization(cloud_secret)
+            return None
+        _show_generated_refresh_token()
+        return "cloud", cloud_auth_cache_key(effective_secret)
 
     try:
         load_local_credentials()
@@ -604,6 +710,8 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    if _handle_cloud_callback():
+        return
     try:
         resolved = _resolve_auth_mode()
     except (ClassroomAPIError, ClassroomConfigurationError) as exc:
@@ -622,6 +730,16 @@ def main() -> None:
         ClassroomConfigurationError,
     ) as exc:
         st.error(str(exc))
+        if auth_mode == "cloud" and isinstance(exc, ClassroomAuthenticationRequired):
+            if st.session_state.get("classroom_cloud_credentials") is not None:
+                if st.button("Conectar novamente ao Google Classroom"):
+                    st.session_state.pop("classroom_cloud_credentials", None)
+                    st.session_state.pop("classroom_show_refresh_token", None)
+                    st.rerun()
+            st.info(
+                "Apague o valor de refresh_token nos Secrets e recarregue o app para "
+                "autorizar novamente. Preserve client_id e client_secret."
+            )
         if auth_mode == "local" and st.button("Autorizar outra conta Google"):
             DEFAULT_TOKEN_PATH.unlink(missing_ok=True)
             st.session_state.pop("oauth_auto_started", None)

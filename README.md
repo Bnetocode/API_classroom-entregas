@@ -141,9 +141,35 @@ python -m venv .venv
 Abra `http://127.0.0.1:8501` no navegador. Se `python` não existir no Linux,
 use `python3.12` ou `python3` no primeiro comando.
 
-Na primeira utilização completa, o projeto também precisa de uma credencial
-OAuth Desktop chamada `credentials.json`. O passo a passo de configuração,
-autorização e validação está em [`instruções.md`](instruções.md).
+Sem Secrets Google configurados, a primeira utilização local usa uma credencial
+OAuth Desktop chamada `credentials.json` e mantém a autorização em `token.json`.
+
+### Google Classroom no Streamlit Cloud
+
+Configure um cliente OAuth **Web application** e cadastre a URL exata do painel
+como **Authorized redirect URI**, por exemplo
+`https://api-classroom-entregas.streamlit.app/`. Em **Settings > Secrets**, use:
+
+```toml
+[google_credentials]
+client_id = "..."
+client_secret = "..."
+refresh_token = ""
+token_uri = "https://oauth2.googleapis.com/token"
+```
+
+1. Abra o painel e clique em **Conectar ao Google Classroom**, mantendo a aba aberta.
+2. Autorize a conta docente na outra aba e volte ao painel original.
+3. Copie o token exibido e cole em `refresh_token` nos Secrets; salve a configuração.
+4. Nas próximas sessões, o painel autentica diretamente com esse token.
+
+O fluxo Cloud usa somente memória e não grava credenciais em disco nem altera
+os Secrets automaticamente. O token gerado só aparece na sessão que o autorizou;
+tokens já configurados nunca são exibidos aos visitantes. A configuração antiga
+`[google_oauth]` continua aceita; `[google_credentials]` tem prioridade. A senha
+de acesso ao app é independente dessa integração.
+
+O passo a passo e a validação estão em [`instruções.md`](instruções.md).
 
 ## Privacidade e segurança
 
